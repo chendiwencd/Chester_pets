@@ -1,4 +1,3 @@
-use base64::{engine::general_purpose::STANDARD, Engine};
 use std::thread;
 use std::time::Duration;
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
@@ -8,7 +7,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::state::{save_history, AppState, ClipboardHistoryItem, ClipboardSignatures};
+use crate::state::{images_dir, save_history, AppState, ClipboardHistoryItem, ClipboardSignatures};
 
 #[derive(Clone, serde::Serialize)]
 struct PanelContent {
@@ -70,10 +69,16 @@ fn append_history(app: &AppHandle, kind: &'static str, value: String) -> u64 {
         pinned: false,
         pinned_at_ms: None,
     });
+    // 到达上限时删最旧的，但跳过置顶项——从最旧一端起找第一个“未置顶”的删除，
+    // 直到回到上限内。如果剩下的全是置顶（没有可删的未置顶项），宁可暂时超过上限也不动置顶内容。
     const MAX_HISTORY: usize = 100;
-    if history.len() > MAX_HISTORY {
-        let overflow = history.len() - MAX_HISTORY;
-        history.drain(0..overflow);
+    while history.len() > MAX_HISTORY {
+        match history.iter().position(|item| !item.pinned) {
+            Some(pos) => {
+                history.remove(pos);
+            }
+            None => break,
+        }
     }
 
     let snapshot = history.clone();
@@ -121,9 +126,25 @@ fn try_forward_image(app: &AppHandle, sig: &mut ClipboardSignatures) -> bool {
         return false;
     }
 
-    let data_url = format!("data:image/png;base64,{}", STANDARD.encode(&png_bytes));
-    let id = append_history(app, "image", data_url.clone());
-    emit_panel_content(app, "panel-img", id, "image", data_url);
+    // 图片以文件形式落盘到 app_data_dir/images/<内容hash>.png，历史里只存文件路径，
+    // 避免把整段 base64 塞进 clipboard_history.json（图片一多 JSON 会膨胀且每次全量重写变慢）。
+    // 用内容 hash 命名：完全相同的图片会得到同一路径，天然完成去重（append_history 按 value 去重）。
+    let Some(dir) = images_dir(app) else {
+        eprintln!("[clipboard] images_dir unavailable, skip image");
+        return false;
+    };
+    let file_name = format!("{}.png", hash_bytes(&png_bytes));
+    let path = dir.join(&file_name);
+    if !path.exists() {
+        if let Err(err) = std::fs::write(&path, &png_bytes) {
+            eprintln!("[clipboard] failed to write image file {}: {err}", path.display());
+            return false;
+        }
+    }
+    let path_str = path.to_string_lossy().to_string();
+
+    let id = append_history(app, "image", path_str.clone());
+    emit_panel_content(app, "panel-img", id, "image", path_str);
     sig.image = Some(signature);
     true
 }

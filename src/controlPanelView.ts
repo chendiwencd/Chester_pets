@@ -1,6 +1,56 @@
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 type SectionKey = "personal" | "pet" | "settings";
+
+// 开关行：左侧标题+说明，右侧一个可点击的开关。initial 决定初始状态，
+// onChange 返回“落地后的真实状态”（命令可能失败），据此回写 UI，避免 UI 和系统实际状态不一致。
+function createToggleRow(
+  title: string,
+  description: string,
+  initial: boolean,
+  onChange: (next: boolean) => Promise<boolean>,
+): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "control-panel-setting-row";
+
+  const textWrap = document.createElement("div");
+  textWrap.className = "control-panel-setting-copy";
+  const heading = document.createElement("div");
+  heading.className = "control-panel-setting-title";
+  heading.textContent = title;
+  const desc = document.createElement("div");
+  desc.className = "control-panel-setting-desc";
+  desc.textContent = description;
+  textWrap.append(heading, desc);
+
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "control-panel-toggle";
+  let state = initial;
+  const sync = () => {
+    toggle.classList.toggle("is-on", state);
+    toggle.setAttribute("role", "switch");
+    toggle.setAttribute("aria-checked", String(state));
+    toggle.textContent = state ? "开" : "关";
+  };
+  sync();
+  toggle.addEventListener("click", async () => {
+    toggle.disabled = true;
+    const desired = !state;
+    try {
+      state = await onChange(desired);
+    } catch (err) {
+      console.error("[controlPanelView] toggle onChange failed", err);
+    } finally {
+      sync();
+      toggle.disabled = false;
+    }
+  });
+
+  row.append(textWrap, toggle);
+  return row;
+}
 
 function createNavButton(label: string, active: boolean, onClick: () => void): HTMLButtonElement {
   const button = document.createElement("button");
@@ -100,7 +150,7 @@ function renderPetSection(content: HTMLElement): void {
   content.append(title, card);
 }
 
-function renderSettingsSection(content: HTMLElement): void {
+async function renderSettingsSection(content: HTMLElement): Promise<void> {
   content.innerHTML = "";
 
   const title = document.createElement("h1");
@@ -109,6 +159,22 @@ function renderSettingsSection(content: HTMLElement): void {
 
   const card = document.createElement("section");
   card.className = "control-panel-card control-panel-settings-card";
+
+  // 开机自启：默认关。初始状态从后端(系统注册表实际状态)读，切换后回写真实结果。
+  let autostartInitial = false;
+  try {
+    autostartInitial = await invoke<boolean>("get_autostart");
+  } catch (err) {
+    console.error("[controlPanelView] get_autostart failed", err);
+  }
+  card.append(
+    createToggleRow(
+      "开机自启",
+      "登录 Windows 后自动启动桌面宠物。",
+      autostartInitial,
+      (next) => invoke<boolean>("set_autostart", { enabled: next }),
+    ),
+  );
 
   card.append(
     createPlaceholderRow("清空记忆", "保留项，后续用于清理历史与记忆数据。"),
@@ -185,7 +251,7 @@ export async function initControlPanelView(root: HTMLElement): Promise<void> {
     } else if (activeSection === "pet") {
       renderPetSection(content);
     } else {
-      renderSettingsSection(content);
+      void renderSettingsSection(content);
     }
 
     layout.append(sidebar, content);

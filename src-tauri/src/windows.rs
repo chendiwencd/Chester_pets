@@ -1,5 +1,5 @@
 use tauri::{
-    AppHandle, LogicalPosition, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
+    AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
 };
 
@@ -34,21 +34,6 @@ impl PanelKind {
             PanelKind::Web => "panel-web",
         }
     }
-
-    // 相对宠物窗口左上角的逻辑像素偏移。主窗口和面板窗口都用逻辑像素定位，
-    // 避免在非 100% 缩放下把主窗口的逻辑尺寸和面板的物理位置混在一起，导致
-    // 面板贴合位置错乱，甚至看起来像"没出现"。
-    pub fn offset(self) -> (i32, i32) {
-        const GAP: i32 = 20;
-        match self {
-            PanelKind::Image => (-(GAP + PANEL_WIDTH as i32), -((PANEL_HEIGHT as i32 - PET_SIZE as i32) / 2)),
-            PanelKind::Text => (
-                -((PANEL_WIDTH as i32 - PET_SIZE as i32) / 2),
-                -(GAP + PANEL_HEIGHT as i32),
-            ),
-            PanelKind::Web => (PET_SIZE as i32 + GAP, -((PANEL_HEIGHT as i32 - PET_SIZE as i32) / 2)),
-        }
-    }
 }
 
 // 把一个窗口矩形（物理像素）压回到"某块显示器内部"。
@@ -60,26 +45,25 @@ impl PanelKind {
 //
 // 策略：挑一块和目标矩形重叠面积最大的显示器（完全不重叠时退回主显示器），
 // 然后把矩形夹进这块显示器的范围内。
-fn clamp_to_visible_area(
+// 选出与目标矩形重叠面积最大的显示器边界(物理像素, (x, y, w, h))；完全不重叠(比如被拖进双屏
+// 空隙)时退回主显示器。这是所有"钳制/边界翻转"逻辑的共同依据。
+fn pick_monitor_bounds(
     app: &AppHandle,
     target: PhysicalPosition<i32>,
     size: PhysicalSize<u32>,
-) -> PhysicalPosition<i32> {
+) -> Option<(i32, i32, i32, i32)> {
     let monitors = app.available_monitors().unwrap_or_default();
     if monitors.is_empty() {
-        return target;
+        return None;
     }
 
     let w = size.width as i32;
     let h = size.height as i32;
-
     let overlap_area = |m: &tauri::Monitor| -> i64 {
         let mp = m.position();
         let ms = m.size();
-        let x_overlap =
-            (target.x + w).min(mp.x + ms.width as i32) - target.x.max(mp.x);
-        let y_overlap =
-            (target.y + h).min(mp.y + ms.height as i32) - target.y.max(mp.y);
+        let x_overlap = (target.x + w).min(mp.x + ms.width as i32) - target.x.max(mp.x);
+        let y_overlap = (target.y + h).min(mp.y + ms.height as i32) - target.y.max(mp.y);
         if x_overlap <= 0 || y_overlap <= 0 {
             0
         } else {
@@ -87,7 +71,6 @@ fn clamp_to_visible_area(
         }
     };
 
-    // 完全不和任何显示器重叠时（比如被拖进了双屏之间的空隙），退回主显示器。
     let primary_name = app
         .primary_monitor()
         .ok()
@@ -102,18 +85,25 @@ fn clamp_to_visible_area(
 
     let mp = best.position();
     let ms = best.size();
-    // 显示器可能比窗口还小，先算出合法区间再夹，避免 min > max 时 clamp panic。
-    let max_x = (mp.x + ms.width as i32 - w).max(mp.x);
-    let max_y = (mp.y + ms.height as i32 - h).max(mp.y);
-    let clamped = PhysicalPosition::new(target.x.clamp(mp.x, max_x), target.y.clamp(mp.y, max_y));
+    Some((mp.x, mp.y, ms.width as i32, ms.height as i32))
+}
 
-    if clamped != target {
-        println!(
-            "[windows] clamped ({}, {}) -> ({}, {}) into monitor pos=({}, {}) size=({}, {})",
-            target.x, target.y, clamped.x, clamped.y, mp.x, mp.y, ms.width, ms.height
-        );
-    }
-    clamped
+// 把一个窗口矩形（物理像素）压回到"某块显示器内部"。多屏不一定拼成完整矩形 + 非 100% 缩放下，
+// 窗口很容易被算到可视区外，这里做最后兜底。
+fn clamp_to_visible_area(
+    app: &AppHandle,
+    target: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
+) -> PhysicalPosition<i32> {
+    let Some((mx, my, mw, mh)) = pick_monitor_bounds(app, target, size) else {
+        return target;
+    };
+    let w = size.width as i32;
+    let h = size.height as i32;
+    // 显示器可能比窗口还小，先算出合法区间再夹，避免 min > max 时 clamp panic。
+    let max_x = (mx + mw - w).max(mx);
+    let max_y = (my + mh - h).max(my);
+    PhysicalPosition::new(target.x.clamp(mx, max_x), target.y.clamp(my, max_y))
 }
 
 // 主宠物窗口：无边框、置顶、不出现在任务栏，尺寸固定，背景透明（只看得到 gif 本身，
@@ -271,34 +261,41 @@ pub fn show_control_panel(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-pub fn build_all_panel_windows(app: &AppHandle, position: PetPosition) -> tauri::Result<()> {
+pub fn build_all_panel_windows(app: &AppHandle, _position: PetPosition) -> tauri::Result<()> {
+    // 以主窗口真实的物理坐标 + 所在屏缩放为准来摆放子窗口（主窗口在 build_main_window 里可能已被
+    // 钳制过，未必等于传入的存档坐标）。
+    let (main_x, main_y, main_scale) = match app.get_webview_window("main") {
+        Some(main) => {
+            let pos = main.outer_position().unwrap_or(PhysicalPosition::new(0, 0));
+            let scale = main.scale_factor().unwrap_or(1.0);
+            (pos.x, pos.y, scale)
+        }
+        None => (0, 0, 1.0),
+    };
     println!(
-        "[windows] prebuild all panels around main logical=({}, {})",
-        position.x, position.y
+        "[windows] prebuild all panels around main phys=({main_x}, {main_y}) scale={main_scale}"
     );
     for kind in PanelKind::ALL {
-        let window = match app.get_webview_window(kind.label()) {
-            Some(existing) => {
-                println!("[windows] {} already exists during setup", kind.label());
-                existing
-            }
-            None => build_panel_window(app, kind)?,
-        };
-        position_panel(&window, kind, position.x, position.y);
+        if app.get_webview_window(kind.label()).is_none() {
+            build_panel_window(app, kind)?;
+        } else {
+            println!("[windows] {} already exists during setup", kind.label());
+        }
     }
+    position_panels_around(app, main_x, main_y, main_scale);
 
     // 预览窗口：默认隐藏，点击内容时才显示
     let preview = match app.get_webview_window("preview") {
         Some(existing) => existing,
         None => build_preview_window(app)?,
     };
-    position_preview(&preview, position.x, position.y);
+    position_preview(&preview, main_x, main_y, main_scale);
 
     let image_viewer = match app.get_webview_window("image-viewer") {
         Some(existing) => existing,
         None => build_image_viewer_window(app)?,
     };
-    position_image_viewer(&image_viewer, position.x, position.y);
+    position_image_viewer(&image_viewer, main_x, main_y, main_scale);
 
     if app.get_webview_window("control-panel").is_none() {
         let _ = build_control_panel_window(app)?;
@@ -306,79 +303,145 @@ pub fn build_all_panel_windows(app: &AppHandle, position: PetPosition) -> tauri:
     Ok(())
 }
 
-pub fn position_preview(window: &WebviewWindow, main_x: i32, main_y: i32) {
+// 子窗口定位统一走这里：全部用物理坐标。
+//
+// 关键点（也是"面板显示在另一块屏"这个 bug 的根因）：逻辑偏移量必须乘以**主窗口所在屏的缩放**
+// 换算成物理偏移，再加到主窗口的物理坐标上——绝不能用子窗口自己当前所在屏的缩放去换算，
+// 因为子窗口可能还停在别的屏上（缩放不同），那样算出来就会落回原来那块屏。
+// main_x/main_y 是主窗口的物理坐标，main_scale 是主窗口所在屏的缩放。
+fn place_child(
+    window: &WebviewWindow,
+    main_x: i32,
+    main_y: i32,
+    main_scale: f64,
+    dx_logical: i32,
+    dy_logical: i32,
+    fallback_w_logical: f64,
+    fallback_h_logical: f64,
+    label: &str,
+) {
+    let target = PhysicalPosition::new(
+        main_x + (dx_logical as f64 * main_scale).round() as i32,
+        main_y + (dy_logical as f64 * main_scale).round() as i32,
+    );
+    let size = window.outer_size().unwrap_or_else(|_| {
+        PhysicalSize::new(
+            (fallback_w_logical * main_scale) as u32,
+            (fallback_h_logical * main_scale) as u32,
+        )
+    });
+    let clamped = clamp_to_visible_area(window.app_handle(), target, size);
+    println!(
+        "[windows] place {label} main_phys=({main_x}, {main_y}) scale={main_scale} offset_logical=({dx_logical}, {dy_logical}) -> ({}, {})",
+        clamped.x, clamped.y
+    );
+    if let Err(err) = window.set_position(clamped) {
+        eprintln!("[windows] failed to set position for {label}: {err}");
+    }
+}
+
+pub fn position_preview(window: &WebviewWindow, main_x: i32, main_y: i32, main_scale: f64) {
     // 预览默认放在宠物正上方，居中对齐
     const GAP: i32 = 20;
     let dx = -((PREVIEW_WIDTH as i32 - PET_SIZE as i32) / 2);
     let dy = -(GAP + PREVIEW_HEIGHT as i32);
-    let logical_target = LogicalPosition::new(main_x + dx, main_y + dy);
-    println!(
-        "[windows] position preview main=({}, {}) offset=({}, {}) logical_target=({}, {})",
-        main_x, main_y, dx, dy, logical_target.x, logical_target.y
+    place_child(
+        window, main_x, main_y, main_scale, dx, dy, PREVIEW_WIDTH, PREVIEW_HEIGHT, "preview",
     );
-
-    let Ok(scale) = window.scale_factor() else {
-        let _ = window.set_position(logical_target);
-        return;
-    };
-    let physical_target: PhysicalPosition<i32> = logical_target.to_physical(scale);
-    let size = window
-        .outer_size()
-        .unwrap_or_else(|_| PhysicalSize::new((PREVIEW_WIDTH * scale) as u32, (PREVIEW_HEIGHT * scale) as u32));
-    let clamped = clamp_to_visible_area(window.app_handle(), physical_target, size);
-    let _ = window.set_position(clamped);
 }
 
-pub fn position_image_viewer(window: &WebviewWindow, main_x: i32, main_y: i32) {
+pub fn position_image_viewer(window: &WebviewWindow, main_x: i32, main_y: i32, main_scale: f64) {
     const GAP: i32 = 24;
     let dx = -((IMAGE_VIEWER_WIDTH as i32 - PET_SIZE as i32) / 2);
     let dy = -(GAP + IMAGE_VIEWER_HEIGHT as i32);
-    let logical_target = LogicalPosition::new(main_x + dx, main_y + dy);
-
-    let Ok(scale) = window.scale_factor() else {
-        let _ = window.set_position(logical_target);
-        return;
-    };
-    let physical_target: PhysicalPosition<i32> = logical_target.to_physical(scale);
-    let size = window.outer_size().unwrap_or_else(|_| {
-        PhysicalSize::new(
-            (IMAGE_VIEWER_WIDTH * scale) as u32,
-            (IMAGE_VIEWER_HEIGHT * scale) as u32,
-        )
-    });
-    let clamped = clamp_to_visible_area(window.app_handle(), physical_target, size);
-    let _ = window.set_position(clamped);
-}
-
-// 每次打开面板时都重新贴合宠物当前位置（面板关闭期间宠物可能已被拖动过）。
-// 这里统一使用逻辑像素，和 build_main_window / petView.ts 保持一致。
-pub fn position_panel(window: &WebviewWindow, kind: PanelKind, main_x: i32, main_y: i32) {
-    let (dx, dy) = kind.offset();
-    let logical_target = LogicalPosition::new(main_x + dx, main_y + dy);
-    println!(
-        "[windows] position {} main=({}, {}) offset=({}, {}) logical_target=({}, {})",
-        kind.label(),
+    place_child(
+        window,
         main_x,
         main_y,
+        main_scale,
         dx,
         dy,
-        logical_target.x,
-        logical_target.y
+        IMAGE_VIEWER_WIDTH,
+        IMAGE_VIEWER_HEIGHT,
+        "image-viewer",
     );
+}
 
-    // 夹回可见区域这一步必须在物理像素空间做（显示器边界本身就是物理像素给的），
-    // 所以这里先把逻辑坐标换算成物理坐标，夹完再直接按物理坐标设置。
-    let Ok(scale) = window.scale_factor() else {
-        let _ = window.set_position(logical_target);
-        return;
+// 同时摆放三个面板，并做"屏幕边界翻转"：
+// 每个面板有一组按优先级排列的候选侧(上/下/左/右)，从中挑第一个「未被别的面板占用且在宠物所在屏
+// 完整放得下」的侧；靠边导致首选侧放不下时会自动翻到另一侧，几个面板各占一侧，既不会盖住宠物、
+// 也不会互相重叠，且始终整块可见。main_x/main_y 为宠物物理坐标，main_scale 为宠物所在屏缩放。
+pub fn position_panels_around(app: &AppHandle, main_x: i32, main_y: i32, main_scale: f64) {
+    // 宠物物理尺寸（优先读真实窗口尺寸，读不到再按逻辑尺寸×缩放估算）
+    let (pet_w, pet_h) = app
+        .get_webview_window("main")
+        .and_then(|w| w.outer_size().ok())
+        .map(|s| (s.width as i32, s.height as i32))
+        .unwrap_or(((PET_SIZE * main_scale) as i32, (PET_SIZE * main_scale) as i32));
+    // 面板物理尺寸（三个同尺寸）
+    let (pan_w, pan_h) = app
+        .get_webview_window("panel-img")
+        .and_then(|w| w.outer_size().ok())
+        .map(|s| (s.width as i32, s.height as i32))
+        .unwrap_or((
+            (PANEL_WIDTH * main_scale) as i32,
+            (PANEL_HEIGHT * main_scale) as i32,
+        ));
+    let gap = (20.0 * main_scale).round() as i32;
+
+    // 宠物所在显示器边界
+    let (mx, my, mw, mh) = pick_monitor_bounds(
+        app,
+        PhysicalPosition::new(main_x, main_y),
+        PhysicalSize::new(pet_w as u32, pet_h as u32),
+    )
+    .unwrap_or((main_x, main_y, pet_w, pet_h));
+
+    // 0=左 1=右 2=上 3=下：给定侧，算面板左上角(沿宠物居中对齐)
+    let candidate = |side: u8| -> (i32, i32) {
+        match side {
+            0 => (main_x - gap - pan_w, main_y + (pet_h - pan_h) / 2),
+            1 => (main_x + pet_w + gap, main_y + (pet_h - pan_h) / 2),
+            2 => (main_x + (pet_w - pan_w) / 2, main_y - gap - pan_h),
+            _ => (main_x + (pet_w - pan_w) / 2, main_y + pet_h + gap),
+        }
     };
-    let physical_target: PhysicalPosition<i32> = logical_target.to_physical(scale);
-    let size = window
-        .outer_size()
-        .unwrap_or_else(|_| PhysicalSize::new((PANEL_WIDTH * scale) as u32, (PANEL_HEIGHT * scale) as u32));
+    let fits = |(x, y): (i32, i32)| -> bool {
+        x >= mx && y >= my && x + pan_w <= mx + mw && y + pan_h <= my + mh
+    };
 
-    let clamped = clamp_to_visible_area(window.app_handle(), physical_target, size);
-    if let Err(err) = window.set_position(clamped) {
-        eprintln!("[windows] failed to set position for {}: {err}", kind.label());
+    // 面板 -> 候选侧优先级。图片默认左、文本默认上、网页默认右；放不下时优先翻到"下"，再上/另一侧。
+    let prefs: [(PanelKind, [u8; 4]); 3] = [
+        (PanelKind::Image, [0, 3, 2, 1]),
+        (PanelKind::Text, [2, 3, 1, 0]),
+        (PanelKind::Web, [1, 3, 2, 0]),
+    ];
+    let mut taken = [false; 4];
+    for (kind, order) in prefs {
+        // 优先：未占用且完整放得下；退一步：仅未占用(允许被钳制)；再退：首选侧。
+        let side = order
+            .iter()
+            .copied()
+            .find(|&s| !taken[s as usize] && fits(candidate(s)))
+            .or_else(|| order.iter().copied().find(|&s| !taken[s as usize]))
+            .unwrap_or(order[0]);
+        taken[side as usize] = true;
+
+        let (tx, ty) = candidate(side);
+        let clamped = clamp_to_visible_area(
+            app,
+            PhysicalPosition::new(tx, ty),
+            PhysicalSize::new(pan_w as u32, pan_h as u32),
+        );
+        if let Some(window) = app.get_webview_window(kind.label()) {
+            let _ = window.set_position(clamped);
+            println!(
+                "[windows] panel {} side={} -> ({}, {})",
+                kind.label(),
+                side,
+                clamped.x,
+                clamped.y
+            );
+        }
     }
 }

@@ -1,4 +1,17 @@
-# Logs
+# ---- 依赖 ----
+node_modules
+.pnp
+.pnp.js
+
+# ---- 构建产物 ----
+dist
+dist-ssr
+build
+*.local
+# TypeScript 增量编译缓存
+*.tsbuildinfo
+
+# ---- 日志 ----
 logs
 *.log
 npm-debug.log*
@@ -7,18 +20,31 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
+# ---- 测试 / 覆盖率 ----
+coverage
+.vitest
+.nyc_output
 
-# Editor directories and files
+# ---- 环境变量 / 密钥 ----
+# 以后接后端服务层时，API key 等放这里，避免被提交
+.env
+.env.*
+!.env.example
+*.pem
+
+# ---- 编辑器 / IDE ----
 .vscode/*
 !.vscode/extensions.json
 .idea
-.DS_Store
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 注意：Rust / Tauri 的忽略（/target、/gen/schemas）在 src-tauri/.gitignore 里单独维护。

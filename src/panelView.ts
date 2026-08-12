@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { resolveImageSrc } from "./media";
 
 type PanelKind = "image" | "text" | "web";
 
@@ -49,8 +50,10 @@ function renderContent(root: HTMLElement, kind: PanelKind, value: string): void 
   if (!value) return;
   if (kind === "image") {
     const img = document.createElement("img");
-    img.src = value;
     img.className = "panel-image panel-clickable";
+    void resolveImageSrc(value).then((src) => {
+      img.src = src;
+    });
     img.addEventListener("click", () => {
       invoke("open_preview", { id: payloadId(root), kind: "image", value }).catch((err) =>
         console.error("[panelView] open_preview failed", err),

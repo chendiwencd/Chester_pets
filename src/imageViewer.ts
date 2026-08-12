@@ -1,4 +1,5 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { resolveImageSrc } from "./media";
 
 interface OriginalImagePayload {
   value: string;
@@ -95,6 +96,8 @@ export async function initImageViewer(root: HTMLElement, img: HTMLImageElement):
     dragging = false;
     activePointerId = undefined;
     applyTransform();
-    img.src = event.payload.value;
+    void resolveImageSrc(event.payload.value).then((src) => {
+      img.src = src;
+    });
   });
 }

@@ -5,7 +5,7 @@ use tauri::image::Image;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::state::{save_history, save_position, AppState, ClipboardHistoryItem, PetPosition};
-use crate::windows::{position_image_viewer, position_panel, position_preview, PanelKind};
+use crate::windows::{position_image_viewer, position_preview, PanelKind};
 use crate::{settings, windows};
 
 #[derive(Clone, serde::Serialize)]
@@ -15,31 +15,11 @@ struct PanelContentPayload {
     value: String,
 }
 
-fn position_all_panels(app: &AppHandle, main_x: i32, main_y: i32) {
-    println!("[panel visibility] position_all_panels main=({main_x}, {main_y})");
-    for kind in PanelKind::ALL {
-        let Some(window) = app.get_webview_window(kind.label()) else {
-            eprintln!(
-                "[panel visibility] {} missing before positioning; setup should have prebuilt it",
-                kind.label()
-            );
-            continue;
-        };
-        println!("[panel visibility] reuse {}", kind.label());
-        position_panel(&window, kind, main_x, main_y);
-        match window.outer_position() {
-            Ok(pos) => println!(
-                "[panel visibility] {} positioned outer=({}, {})",
-                kind.label(),
-                pos.x,
-                pos.y
-            ),
-            Err(err) => eprintln!(
-                "[panel visibility] failed to read {} outer_position after set_position: {err}",
-                kind.label()
-            ),
-        }
-    }
+// main_x/main_y 为主窗口物理坐标，main_scale 为主窗口所在屏缩放。
+// 具体的边界翻转/防重叠布局在 windows::position_panels_around 里。
+fn position_all_panels(app: &AppHandle, main_x: i32, main_y: i32, main_scale: f64) {
+    println!("[panel visibility] position_all_panels main_phys=({main_x}, {main_y}) scale={main_scale}");
+    windows::position_panels_around(app, main_x, main_y, main_scale);
 }
 
 fn latest_history_value(history: &[ClipboardHistoryItem], kind: &str) -> Option<(u64, String)> {
@@ -117,22 +97,13 @@ pub fn set_panel_visibility(app: AppHandle, state: State<AppState>, open: bool) 
             return open;
         }
     };
-    let logical_position = position.to_logical::<f64>(scale_factor);
     println!(
-        "[panel visibility] main outer=({}, {}), scale_factor={}, logical=({}, {})",
-        position.x,
-        position.y,
-        scale_factor,
-        logical_position.x,
-        logical_position.y
+        "[panel visibility] main outer=({}, {}), scale_factor={}",
+        position.x, position.y, scale_factor
     );
 
     if open {
-        position_all_panels(
-            &app,
-            logical_position.x.round() as i32,
-            logical_position.y.round() as i32,
-        );
+        position_all_panels(&app, position.x, position.y, scale_factor);
     }
 
     for kind in PanelKind::ALL {
@@ -190,6 +161,47 @@ pub fn open_control_panel(app: AppHandle) {
     let _ = windows::show_control_panel(&app);
 }
 
+#[tauri::command]
+pub fn recall_pet(app: AppHandle) {
+    recall_pet_impl(&app);
+}
+
+// 召回宠物：把主窗口移回主显示器工作区中央并显示聚焦。无论之前因为跨屏坐标问题被摆到哪，
+// 这个都能把它找回来。托盘菜单和 recall_pet 命令共用。
+pub fn recall_pet_impl(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        eprintln!("[recall_pet] main window not found");
+        return;
+    };
+
+    if let Ok(Some(monitor)) = window.primary_monitor() {
+        let mpos = monitor.position();
+        let msize = monitor.size();
+        let win = window
+            .outer_size()
+            .unwrap_or(tauri::PhysicalSize::new(120, 120));
+        let cx = mpos.x + (msize.width as i32 - win.width as i32) / 2;
+        let cy = mpos.y + (msize.height as i32 - win.height as i32) / 2;
+        let _ = window.set_position(tauri::PhysicalPosition::new(cx, cy));
+        println!("[recall_pet] centered at ({cx}, {cy}) on primary monitor");
+    }
+
+    let _ = window.show();
+    let _ = window.set_focus();
+
+    // 保存新位置（逻辑像素，与 build_main_window 的还原口径一致）。
+    if let (Ok(pos), Ok(scale)) = (window.outer_position(), window.scale_factor()) {
+        let logical = pos.to_logical::<f64>(scale);
+        let _ = save_position(
+            app,
+            PetPosition {
+                x: logical.x.round() as i32,
+                y: logical.y.round() as i32,
+            },
+        );
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 struct PreviewPayload {
     id: Option<u64>,
@@ -232,10 +244,9 @@ pub fn open_preview(
     let (Ok(position), Ok(scale_factor)) = (main_window.outer_position(), main_window.scale_factor()) else {
         return;
     };
-    let logical = position.to_logical::<f64>(scale_factor);
 
     if let Some(preview) = app.get_webview_window("preview") {
-        position_preview(&preview, logical.x.round() as i32, logical.y.round() as i32);
+        position_preview(&preview, position.x, position.y, scale_factor);
         let _ = preview.show();
         let _ = preview.set_focus();
         let _ = app.emit_to(
@@ -251,7 +262,13 @@ pub fn open_preview(
 // 展示逻辑和 open_preview 一致（同一个 preview 窗口），区别只在于选中哪一条——
 // 这里默认选中最新的一条，避免右侧内容区一进来就是空白；历史为空时只展示空列表。
 #[tauri::command]
-pub fn open_storage(app: AppHandle, state: State<AppState>) {
+pub fn open_storage(app: AppHandle) {
+    open_storage_impl(&app);
+}
+
+// 打开存储区的实际逻辑，抽成普通函数，供 open_storage 命令和全局快捷键(Ctrl+Shift+V)共用。
+pub fn open_storage_impl(app: &AppHandle) {
+    let state = app.state::<AppState>();
     // 和 open_preview 保持一致：进入存储区时收起三个面板窗口
     {
         let mut panel_open = state.panel_open.lock().unwrap();
@@ -273,13 +290,12 @@ pub fn open_storage(app: AppHandle, state: State<AppState>) {
         eprintln!("[open_storage] failed to read main window position/scale");
         return;
     };
-    let logical = position.to_logical::<f64>(scale_factor);
 
     let Some(preview) = app.get_webview_window("preview") else {
         eprintln!("[open_storage] preview window not found");
         return;
     };
-    position_preview(&preview, logical.x.round() as i32, logical.y.round() as i32);
+    position_preview(&preview, position.x, position.y, scale_factor);
     let _ = preview.show();
     let _ = preview.set_focus();
 
@@ -306,6 +322,39 @@ pub fn open_storage(app: AppHandle, state: State<AppState>) {
     let _ = app.emit_to("main", "preview-state", PreviewStatePayload { open: true });
 }
 
+// 开机自启：读/写系统实际的自启注册状态，并把选择同步进 settings.json。
+#[tauri::command]
+pub fn get_autostart(app: AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[tauri::command]
+pub fn set_autostart(app: AppHandle, enabled: bool) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    if let Err(err) = result {
+        eprintln!("[autostart] failed to set enabled={enabled}: {err}");
+    }
+
+    // 以系统实际状态为准回写 settings.json，避免设置文件和注册表状态不一致。
+    let actual = manager.is_enabled().unwrap_or(false);
+    let monitor_mode = *app.state::<AppState>().monitor_mode.lock().unwrap();
+    let _ = crate::state::save_settings(
+        &app,
+        &crate::state::AppSettings {
+            monitor_mode,
+            autostart: actual,
+        },
+    );
+    actual
+}
+
 #[tauri::command]
 pub fn open_original_image(app: AppHandle, value: String) {
     let Some(main_window) = app.get_webview_window("main") else {
@@ -314,10 +363,9 @@ pub fn open_original_image(app: AppHandle, value: String) {
     let (Ok(position), Ok(scale_factor)) = (main_window.outer_position(), main_window.scale_factor()) else {
         return;
     };
-    let logical = position.to_logical::<f64>(scale_factor);
 
     if let Some(window) = app.get_webview_window("image-viewer") {
-        position_image_viewer(&window, logical.x.round() as i32, logical.y.round() as i32);
+        position_image_viewer(&window, position.x, position.y, scale_factor);
         let _ = window.show();
         let _ = window.set_focus();
         let _ = app.emit_to(
@@ -368,11 +416,23 @@ pub fn copy_clipboard_history_item(app: AppHandle, state: State<AppState>, id: u
     };
 
     if item.kind == "image" {
-        let Some((_, base64_part)) = item.value.split_once(',') else {
-            return;
-        };
-        let Ok(bytes) = STANDARD.decode(base64_part) else {
-            return;
+        // 新数据 value 是文件路径；旧数据可能仍是 data URL，两种都兼容。
+        let bytes = if let Some((_, base64_part)) = item
+            .value
+            .starts_with("data:")
+            .then(|| item.value.split_once(','))
+            .flatten()
+        {
+            let Ok(bytes) = STANDARD.decode(base64_part) else {
+                return;
+            };
+            bytes
+        } else {
+            let Ok(bytes) = std::fs::read(&item.value) else {
+                eprintln!("[copy] failed to read image file {}", item.value);
+                return;
+            };
+            bytes
         };
         let Ok(decoded) = image::load_from_memory(&bytes) else {
             return;
@@ -387,6 +447,17 @@ pub fn copy_clipboard_history_item(app: AppHandle, state: State<AppState>, id: u
     } else {
         let _ = app.clipboard().write_text(item.value);
     }
+}
+
+// 按需把图片文件读成 data URL 给前端 <img> 显示。只有真正要显示某张图时才调用，
+// 历史 JSON 本身只存路径，保持轻量。旧的 data: 数据直接原样返回，向后兼容。
+#[tauri::command]
+pub fn read_image_data_url(value: String) -> Option<String> {
+    if value.starts_with("data:") {
+        return Some(value);
+    }
+    let bytes = std::fs::read(&value).ok()?;
+    Some(format!("data:image/png;base64,{}", STANDARD.encode(&bytes)))
 }
 
 #[tauri::command]

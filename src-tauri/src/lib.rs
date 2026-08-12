@@ -7,19 +7,49 @@ mod windows;
 
 use tauri::{Emitter, Manager, WindowEvent};
 use std::time::Duration;
-use windows::{position_panel, PanelKind};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+const STORAGE_SHORTCUT: &str = "CmdOrCtrl+Shift+V";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 单实例保护必须第一个注册：第二次启动时唤醒已有宠物窗口而不是再开一个进程。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None::<Vec<&str>>,
+        ))
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    // 只注册了 Ctrl+Shift+V 一个全局快捷键，按下(而非松开)时打开存储区。
+                    if event.state() == ShortcutState::Pressed
+                        && shortcut.matches(
+                            tauri_plugin_global_shortcut::Modifiers::CONTROL
+                                | tauri_plugin_global_shortcut::Modifiers::SHIFT,
+                            tauri_plugin_global_shortcut::Code::KeyV,
+                        )
+                    {
+                        commands::open_storage_impl(app);
+                    }
+                })
+                .build(),
+        )
         .manage(state::AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::add_text_history_item,
             commands::clear_clipboard_history,
             commands::copy_clipboard_history_item,
             commands::delete_clipboard_history_item,
+            commands::get_autostart,
             commands::get_monitor_mode,
             commands::log_debug,
             commands::get_clipboard_history,
@@ -29,6 +59,9 @@ pub fn run() {
             commands::open_storage,
             commands::close_preview,
             commands::poll_clipboard,
+            commands::read_image_data_url,
+            commands::recall_pet,
+            commands::set_autostart,
             commands::toggle_pin_clipboard_history_item,
             commands::save_pet_position,
             commands::set_panel_visibility,
@@ -55,6 +88,28 @@ pub fn run() {
                     history.iter().map(|item| item.id).max().unwrap_or(0);
                 *app_state.monitor_mode.lock().unwrap() = settings.monitor_mode;
             }
+
+            // 让系统自启注册状态与 settings.json 里的 autostart 一致（默认 false）。
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let manager = handle.autolaunch();
+                let currently = manager.is_enabled().unwrap_or(false);
+                if settings.autostart && !currently {
+                    let _ = manager.enable();
+                } else if !settings.autostart && currently {
+                    let _ = manager.disable();
+                }
+                println!("[setup] autostart target={}", settings.autostart);
+            }
+
+            // 注册全局快捷键 Ctrl+Shift+V 打开存储区（常驻，整个应用生命周期都在）。
+            match handle.global_shortcut().register(STORAGE_SHORTCUT) {
+                Ok(_) => println!("[setup] registered global shortcut {STORAGE_SHORTCUT}"),
+                Err(err) => {
+                    eprintln!("[setup] failed to register {STORAGE_SHORTCUT}: {err}")
+                }
+            }
+
             windows::build_main_window(handle, position)?;
             windows::build_all_panel_windows(handle, position)?;
             tray::setup_tray(handle)?;
@@ -107,25 +162,11 @@ pub fn run() {
                     if let (Ok(position), Ok(scale_factor)) =
                         (window.outer_position(), window.scale_factor())
                     {
-                        let logical = position.to_logical::<f64>(scale_factor);
                         println!(
-                            "[main moved] outer=({}, {}), scale_factor={}, logical=({}, {}), panel_open={panel_open}",
-                            position.x,
-                            position.y,
-                            scale_factor,
-                            logical.x,
-                            logical.y
+                            "[main moved] outer=({}, {}), scale_factor={}, panel_open={panel_open}",
+                            position.x, position.y, scale_factor
                         );
-                        for kind in PanelKind::ALL {
-                            if let Some(panel_window) = handle.get_webview_window(kind.label()) {
-                                position_panel(
-                                    &panel_window,
-                                    kind,
-                                    logical.x.round() as i32,
-                                    logical.y.round() as i32,
-                                );
-                            }
-                        }
+                        windows::position_panels_around(handle, position.x, position.y, scale_factor);
                     }
                 }
             }

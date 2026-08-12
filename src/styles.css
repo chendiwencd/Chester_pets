@@ -855,3 +855,30 @@ body {
   font-size: 12px;
   white-space: nowrap;
 }
+
+.control-panel-toggle {
+  flex: none;
+  min-width: 56px;
+  height: 28px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(138, 79, 66, 0.35);
+  background: rgba(181, 111, 93, 0.12);
+  color: #8a4f42;
+  font-size: 13px;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.control-panel-toggle.is-on {
+  background: #4c8a5a;
+  border-color: #4c8a5a;
+  color: #fff;
+}
+
+.control-panel-toggle:disabled {
+  opacity: 0.6;
+  cursor: default;
+}

@@ -9,6 +9,10 @@
 | `waiting.gif` | 等待 (`waiting`) | `idle_loop_down.gif` |
 | `open.gif` | 打开 (`open`)，悬浮或面板打开时都用这张 | `open.gif`（原名就是 open，直接对应） |
 | `moving.gif` | 移动 (`moving`)，左右共用一张 | `walk_loop_side.gif`（侧面视角） |
+| `sleep_loop.gif` | 休眠 (`sleep`)，长时间无操作后进入 | `sleep_loop.gif` |
+
+待机时的"小动作"改成了**自己走一小段短距离**（漫步），走的就是 `moving.gif` 这张移动动画，不再单独准备
+待机动画资源，所以这里没有 idle 动作图。漫步的距离/频率在 `petView.ts` 的 `IDLE_WANDER_*` 常量里调。
 
 **移动没有存两份"向左/向右"的文件**：`moving.gif` 是侧面视角的行走图，左右两个方向靠
 `spriteRenderer.ts` 在渲染时用 CSS `transform: scaleX(-1)` 水平镜像同一张图来区分，不用为

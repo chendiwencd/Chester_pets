@@ -54,11 +54,17 @@ pub struct ClipboardHistoryItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub monitor_mode: bool,
+    // 开机自启，默认关。#[serde(default)] 保证旧版 settings.json（没有该字段）也能正常加载。
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
-        Self { monitor_mode: false }
+        Self {
+            monitor_mode: false,
+            autostart: false,
+        }
     }
 }
 
@@ -81,6 +87,13 @@ fn settings_config_path(app: &AppHandle) -> Option<PathBuf> {
         .app_config_dir()
         .ok()
         .map(|dir| dir.join("settings.json"))
+}
+
+// 图片历史的落盘目录：app_data_dir/images/。首次访问时创建。
+pub fn images_dir(app: &AppHandle) -> Option<PathBuf> {
+    let dir = app.path().app_data_dir().ok()?.join("images");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
 }
 
 pub fn load_position(app: &AppHandle) -> PetPosition {

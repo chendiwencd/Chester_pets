@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { resolveImageSrc } from "./media";
 
 type PanelKind = "image" | "text" | "web";
 
@@ -60,8 +61,10 @@ function renderContent(root: HTMLElement, kind: PanelKind, value: string): void 
 
   if (kind === "image") {
     const img = document.createElement("img");
-    img.src = value;
     img.className = "panel-image preview-image-clickable";
+    void resolveImageSrc(value).then((src) => {
+      img.src = src;
+    });
     img.addEventListener("click", () => {
       invoke("open_original_image", { value }).catch((err) =>
         console.error("[previewView] open_original_image failed", err),
@@ -83,12 +86,26 @@ function renderContent(root: HTMLElement, kind: PanelKind, value: string): void 
   });
 }
 
+// 时间戳按“距今远近”分档，越近显示得越省略：
+// - 当天：只显示 时:分（HH:mm）
+// - 当年内的其它日期：显示 月-日 时:分（MM-DD HH:mm）
+// - 往年：显示 年-月-日 时:分（YYYY-MM-DD HH:mm）
 function formatTime(ms: number): string {
   const d = new Date(ms);
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ss = String(d.getSeconds()).padStart(2, "0");
-  return `${hh}:${mm}:${ss}`;
+  const now = new Date();
+  const p2 = (n: number) => String(n).padStart(2, "0");
+  const hm = `${p2(d.getHours())}:${p2(d.getMinutes())}`;
+
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  if (sameDay) return hm;
+
+  const md = `${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+  if (d.getFullYear() === now.getFullYear()) return `${md} ${hm}`;
+
+  return `${d.getFullYear()}-${md} ${hm}`;
 }
 
 function createIcon(kind: "text" | "image", extraClass?: string): HTMLElement {
