@@ -1,59 +1,23 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
+use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager, State};
 use tauri::image::Image;
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
-use crate::state::{save_history, save_position, AppState, ClipboardHistoryItem, PetPosition};
-use crate::windows::{position_image_viewer, position_preview, PanelKind};
+use crate::state::{
+    images_dir, save_history, save_position, AppState, ClipboardHistoryItem, PetPosition,
+};
+use crate::windows::{position_image_viewer, position_preview, PanelKind, ScreenRect};
 use crate::{settings, windows};
-
-#[derive(Clone, serde::Serialize)]
-struct PanelContentPayload {
-    id: Option<u64>,
-    kind: String,
-    value: String,
-}
 
 // main_x/main_y 为主窗口物理坐标，main_scale 为主窗口所在屏缩放。
 // 具体的边界翻转/防重叠布局在 windows::position_panels_around 里。
 fn position_all_panels(app: &AppHandle, main_x: i32, main_y: i32, main_scale: f64) {
-    println!("[panel visibility] position_all_panels main_phys=({main_x}, {main_y}) scale={main_scale}");
+    println!(
+        "[panel visibility] position_all_panels main_phys=({main_x}, {main_y}) scale={main_scale}"
+    );
     windows::position_panels_around(app, main_x, main_y, main_scale);
-}
-
-fn latest_history_value(history: &[ClipboardHistoryItem], kind: &str) -> Option<(u64, String)> {
-    history
-        .iter()
-        .rev()
-        .find(|item| item.kind == kind)
-        .map(|item| (item.id, item.value.clone()))
-}
-
-fn refresh_primary_panels_from_history(app: &AppHandle, state: &State<AppState>) {
-    let history = state.clipboard_history.lock().unwrap().clone();
-
-    let image_payload = latest_history_value(&history, "image");
-    let _ = app.emit_to(
-        "panel-img",
-        "panel-content",
-        PanelContentPayload {
-            id: image_payload.as_ref().map(|(id, _)| *id),
-            kind: "image".to_string(),
-            value: image_payload.map(|(_, value)| value).unwrap_or_default(),
-        },
-    );
-
-    let text_payload = latest_history_value(&history, "text");
-    let _ = app.emit_to(
-        "panel-text",
-        "panel-content",
-        PanelContentPayload {
-            id: text_payload.as_ref().map(|(id, _)| *id),
-            kind: "text".to_string(),
-            value: text_payload.map(|(_, value)| value).unwrap_or_default(),
-        },
-    );
 }
 
 #[tauri::command]
@@ -108,7 +72,10 @@ pub fn set_panel_visibility(app: AppHandle, state: State<AppState>, open: bool) 
 
     for kind in PanelKind::ALL {
         let Some(window) = app.get_webview_window(kind.label()) else {
-            eprintln!("[panel visibility] {} missing after positioning", kind.label());
+            eprintln!(
+                "[panel visibility] {} missing after positioning",
+                kind.label()
+            );
             continue;
         };
         if open {
@@ -116,7 +83,10 @@ pub fn set_panel_visibility(app: AppHandle, state: State<AppState>, open: bool) 
                 eprintln!("[panel visibility] failed to show {}: {err}", kind.label());
             } else {
                 let visible = window.is_visible().unwrap_or(false);
-                println!("[panel visibility] showed {} visible={visible}", kind.label());
+                println!(
+                    "[panel visibility] showed {} visible={visible}",
+                    kind.label()
+                );
             }
         } else if let Err(err) = window.hide() {
             eprintln!("[panel visibility] failed to hide {}: {err}", kind.label());
@@ -126,11 +96,27 @@ pub fn set_panel_visibility(app: AppHandle, state: State<AppState>, open: bool) 
         }
     }
 
-    if open {
-        refresh_primary_panels_from_history(&app, &state);
-    }
-
     open
+}
+
+#[tauri::command]
+pub fn resize_input_panel(app: AppHandle, height: f64) {
+    let Some(window) = app.get_webview_window(PanelKind::Web.label()) else {
+        return;
+    };
+    let height = height.clamp(windows::PANEL_HEIGHT, 560.0);
+    let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
+        windows::PANEL_WIDTH,
+        height,
+    )));
+
+    if let Some(main_window) = app.get_webview_window("main") {
+        if let (Ok(position), Ok(scale_factor)) =
+            (main_window.outer_position(), main_window.scale_factor())
+        {
+            windows::position_panels_around(&app, position.x, position.y, scale_factor);
+        }
+    }
 }
 
 #[tauri::command]
@@ -219,6 +205,214 @@ struct OriginalImagePayload {
     value: String,
 }
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct ScreenshotSelectionRect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ScreenshotResultPayload {
+    ocr_text: String,
+    image_data_url: String,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct FileInfoPayload {
+    #[serde(default)]
+    kind: String,
+    name: String,
+    size_bytes: Option<u64>,
+    display_size: String,
+    type_placeholder: String,
+    #[serde(default)]
+    preview: String,
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 || value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn capture_screenshot_data_url(rect: &ScreenshotSelectionRect) -> Option<String> {
+    use screenshots::image::codecs::png::PngEncoder;
+    use screenshots::image::{ColorType, ImageEncoder};
+
+    let screen = screenshots::Screen::from_point(rect.x, rect.y).ok()?;
+    let display = screen.display_info;
+    let local_x = rect.x - display.x;
+    let local_y = rect.y - display.y;
+    let image = screen
+        .capture_area(local_x, local_y, rect.width, rect.height)
+        .ok()?;
+
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            ColorType::Rgba8,
+        )
+        .ok()?;
+    Some(format!("data:image/png;base64,{}", STANDARD.encode(png)))
+}
+
+pub fn show_file_info_payload(app: &AppHandle, payload: FileInfoPayload) {
+    let mut payload = payload;
+    if payload.kind.is_empty() {
+        payload.kind = "file".to_string();
+    }
+    if payload.preview.is_empty() {
+        payload.preview = payload.name.clone();
+    }
+    let window = match app.get_webview_window("panel-web") {
+        Some(existing) => existing,
+        None => match windows::build_panel_window(app, PanelKind::Web) {
+            Ok(window) => window,
+            Err(err) => {
+                eprintln!("[input-panel] failed to build window: {err}");
+                return;
+            }
+        },
+    };
+
+    if let Some(main_window) = app.get_webview_window("main") {
+        if let (Ok(position), Ok(scale_factor)) =
+            (main_window.outer_position(), main_window.scale_factor())
+        {
+            windows::position_panels_around(app, position.x, position.y, scale_factor);
+        }
+    }
+
+    *app.state::<AppState>().panel_open.lock().unwrap() = true;
+    let _ = window.show();
+    let _ = window.set_focus();
+    let _ = app.emit_to("panel-web", "input-panel-content", payload);
+}
+
+pub fn show_file_info_for_path(app: &AppHandle, path: &std::path::Path) {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| path.display().to_string());
+    let size_bytes = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+    let display_size = size_bytes
+        .map(format_file_size)
+        .unwrap_or_else(|| "0 B".to_string());
+    show_file_info_payload(
+        app,
+        FileInfoPayload {
+            kind: classify_path_kind(path).to_string(),
+            name,
+            size_bytes,
+            display_size,
+            type_placeholder: path.display().to_string(),
+            preview: path.display().to_string(),
+        },
+    );
+}
+
+fn classify_path_kind(path: &std::path::Path) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "avif" | "bmp" | "gif" | "heic" | "jpeg" | "jpg" | "png" | "svg" | "webp" => "image",
+        _ => "file",
+    }
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn clipboard_image_payload(app: &AppHandle) -> Option<FileInfoPayload> {
+    let image = app.clipboard().read_image().ok()?;
+    let width = image.width();
+    let height = image.height();
+    let rgba = image.rgba().to_vec();
+    let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, rgba)?;
+
+    let mut png_bytes: Vec<u8> = Vec::new();
+    DynamicImage::ImageRgba8(buffer)
+        .write_to(&mut std::io::Cursor::new(&mut png_bytes), ImageFormat::Png)
+        .ok()?;
+
+    let dir = images_dir(app)?;
+    let file_name = format!("{}.png", hash_bytes(&png_bytes));
+    let path = dir.join(file_name);
+    if !path.exists() {
+        std::fs::write(&path, &png_bytes).ok()?;
+    }
+
+    let value = path.to_string_lossy().to_string();
+    crate::clipboard::append_history(app, "image", value.clone());
+
+    Some(FileInfoPayload {
+        kind: "image".to_string(),
+        name: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "clipboard.png".to_string()),
+        size_bytes: Some(png_bytes.len() as u64),
+        display_size: format_file_size(png_bytes.len() as u64),
+        type_placeholder: value.clone(),
+        preview: value,
+    })
+}
+
+fn clipboard_text_payload(app: &AppHandle) -> Option<FileInfoPayload> {
+    let text = app.clipboard().read_text().ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value = trimmed.to_string();
+    crate::clipboard::append_history(app, "text", value.clone());
+
+    Some(FileInfoPayload {
+        kind: "text".to_string(),
+        name: "剪贴板文本".to_string(),
+        size_bytes: Some(value.len() as u64),
+        display_size: format_file_size(value.len() as u64),
+        type_placeholder: "文本资源".to_string(),
+        preview: value,
+    })
+}
+
+#[tauri::command]
+pub fn paste_clipboard_to_input_panel(app: AppHandle, state: State<AppState>) -> Option<FileInfoPayload> {
+    if !*state.panel_open.lock().unwrap() {
+        return None;
+    }
+
+    let payload = clipboard_image_payload(&app).or_else(|| clipboard_text_payload(&app))?;
+    let _ = app.emit_to("panel-web", "input-panel-content", payload.clone());
+    Some(payload)
+}
+
 #[tauri::command]
 pub fn open_preview(
     app: AppHandle,
@@ -232,7 +426,7 @@ pub fn open_preview(
         let mut panel_open = state.panel_open.lock().unwrap();
         *panel_open = false;
     }
-    for label in ["panel-img", "panel-text", "panel-web"] {
+    for label in ["panel-web"] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.hide();
         }
@@ -241,7 +435,9 @@ pub fn open_preview(
     let Some(main_window) = app.get_webview_window("main") else {
         return;
     };
-    let (Ok(position), Ok(scale_factor)) = (main_window.outer_position(), main_window.scale_factor()) else {
+    let (Ok(position), Ok(scale_factor)) =
+        (main_window.outer_position(), main_window.scale_factor())
+    else {
         return;
     };
 
@@ -274,7 +470,7 @@ pub fn open_storage_impl(app: &AppHandle) {
         let mut panel_open = state.panel_open.lock().unwrap();
         *panel_open = false;
     }
-    for label in ["panel-img", "panel-text", "panel-web"] {
+    for label in ["panel-web"] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.hide();
         }
@@ -299,24 +495,31 @@ pub fn open_storage_impl(app: &AppHandle) {
     let _ = preview.show();
     let _ = preview.set_focus();
 
-    let latest = {
-        let history = state.clipboard_history.lock().unwrap();
-        history.last().cloned()
-    };
-    println!(
-        "[open_storage] shown, preselect={}",
-        latest.as_ref().map_or("none".to_string(), |item| item.id.to_string())
-    );
-    if let Some(item) = latest {
-        let _ = app.emit_to(
-            "preview",
-            "preview-content",
-            PreviewPayload {
-                id: Some(item.id),
-                kind: item.kind,
-                value: item.value,
-            },
+    let monitor_mode = *state.monitor_mode.lock().unwrap();
+    if monitor_mode {
+        let latest = {
+            let history = state.clipboard_history.lock().unwrap();
+            history.last().cloned()
+        };
+        println!(
+            "[open_storage] monitor_mode=true, shown, preselect={}",
+            latest
+                .as_ref()
+                .map_or("none".to_string(), |item| item.id.to_string())
         );
+        if let Some(item) = latest {
+            let _ = app.emit_to(
+                "preview",
+                "preview-content",
+                PreviewPayload {
+                    id: Some(item.id),
+                    kind: item.kind,
+                    value: item.value,
+                },
+            );
+        }
+    } else {
+        println!("[open_storage] monitor_mode=false, skip preselect from clipboard");
     }
 
     let _ = app.emit_to("main", "preview-state", PreviewStatePayload { open: true });
@@ -360,7 +563,9 @@ pub fn open_original_image(app: AppHandle, value: String) {
     let Some(main_window) = app.get_webview_window("main") else {
         return;
     };
-    let (Ok(position), Ok(scale_factor)) = (main_window.outer_position(), main_window.scale_factor()) else {
+    let (Ok(position), Ok(scale_factor)) =
+        (main_window.outer_position(), main_window.scale_factor())
+    else {
         return;
     };
 
@@ -387,9 +592,6 @@ pub fn clear_clipboard_history(app: AppHandle, state: State<AppState>) {
     *state.clipboard_signatures.lock().unwrap() = crate::state::ClipboardSignatures::default();
     let _ = save_history(&app, &[]);
     let _ = app.emit_to("preview", "history-cleared", ());
-    if *state.panel_open.lock().unwrap() {
-        refresh_primary_panels_from_history(&app, &state);
-    }
 }
 
 #[tauri::command]
@@ -400,9 +602,6 @@ pub fn delete_clipboard_history_item(app: AppHandle, state: State<AppState>, id:
     drop(history);
     let _ = save_history(&app, &snapshot);
     let _ = app.emit_to("preview", "history-deleted", id);
-    if *state.panel_open.lock().unwrap() {
-        refresh_primary_panels_from_history(&app, &state);
-    }
 }
 
 #[tauri::command]
@@ -438,13 +637,10 @@ pub fn copy_clipboard_history_item(app: AppHandle, state: State<AppState>, id: u
             return;
         };
         let rgba = decoded.to_rgba8();
-        let image = Image::new_owned(
-            rgba.as_raw().clone(),
-            rgba.width(),
-            rgba.height(),
-        );
+        let image = Image::new_owned(rgba.as_raw().clone(), rgba.width(), rgba.height());
         let _ = app.clipboard().write_image(&image);
     } else {
+        // text / note 都是内联文本，直接回写。
         let _ = app.clipboard().write_text(item.value);
     }
 }
@@ -467,10 +663,6 @@ pub fn add_text_history_item(app: AppHandle, value: String) -> Option<u64> {
         return None;
     }
     let id = crate::clipboard::append_manual_text_history(&app, trimmed.to_string());
-    let state = app.state::<AppState>();
-    if *state.panel_open.lock().unwrap() {
-        refresh_primary_panels_from_history(&app, &state);
-    }
     Some(id)
 }
 
@@ -510,9 +702,74 @@ pub fn close_preview(app: AppHandle) {
     }
 }
 
+#[tauri::command]
+pub fn open_screenshot_selector(app: AppHandle) {
+    if let Err(err) = windows::show_screenshot_selector(&app) {
+        eprintln!("[screenshot] failed to show selector: {err}");
+    }
+}
+
+#[tauri::command]
+pub fn close_screenshot_selector(app: AppHandle) {
+    if let Some(window) = app.get_webview_window("screenshot-selector") {
+        let _ = window.hide();
+    }
+}
+
+#[tauri::command]
+pub fn complete_screenshot_selection(app: AppHandle, rect: ScreenshotSelectionRect) {
+    if let Some(window) = app.get_webview_window("screenshot-selector") {
+        let _ = window.hide();
+    }
+    if rect.width < 2 || rect.height < 2 {
+        return;
+    }
+    let image_data_url = capture_screenshot_data_url(&rect).unwrap_or_default();
+
+    let window = match app.get_webview_window("screenshot-result") {
+        Some(existing) => existing,
+        None => match windows::build_screenshot_result_window(&app) {
+            Ok(window) => window,
+            Err(err) => {
+                eprintln!("[screenshot] failed to build result window: {err}");
+                return;
+            }
+        },
+    };
+    windows::position_screenshot_result(
+        &app,
+        ScreenRect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        },
+    );
+    let _ = window.show();
+    let _ = window.set_focus();
+    let _ = app.emit_to(
+        "screenshot-result",
+        "screenshot-result",
+        ScreenshotResultPayload {
+            ocr_text: String::new(),
+            image_data_url,
+        },
+    );
+}
+
+#[tauri::command]
+pub fn show_file_info(app: AppHandle, payload: FileInfoPayload) {
+    show_file_info_payload(&app, payload);
+}
+
 // 供 lib.rs 在“应用整体失焦”时调用：一把梭隐藏所有面板/预览窗口
 pub fn hide_all_overlays(app: &AppHandle) {
-    for label in ["panel-img", "panel-text", "panel-web", "preview"] {
+    for label in [
+        "panel-web",
+        "preview",
+        "screenshot-selector",
+        "screenshot-result",
+    ] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.hide();
         }

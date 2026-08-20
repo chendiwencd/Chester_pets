@@ -5,11 +5,17 @@ mod state;
 mod tray;
 mod windows;
 
-use tauri::{Emitter, Manager, WindowEvent};
 use std::time::Duration;
+use tauri::{DragDropEvent, Emitter, Manager, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 const STORAGE_SHORTCUT: &str = "CmdOrCtrl+Shift+V";
+const SCREENSHOT_SHORTCUT: &str = "Alt+D";
+
+#[derive(Clone, serde::Serialize)]
+struct FileDragStatePayload {
+    active: bool,
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -40,6 +46,14 @@ pub fn run() {
                     {
                         commands::open_storage_impl(app);
                     }
+                    if event.state() == ShortcutState::Pressed
+                        && shortcut.matches(
+                            tauri_plugin_global_shortcut::Modifiers::ALT,
+                            tauri_plugin_global_shortcut::Code::KeyD,
+                        )
+                    {
+                        commands::open_screenshot_selector(app.clone());
+                    }
                 })
                 .build(),
         )
@@ -47,6 +61,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::add_text_history_item,
             commands::clear_clipboard_history,
+            commands::close_screenshot_selector,
+            commands::complete_screenshot_selection,
             commands::copy_clipboard_history_item,
             commands::delete_clipboard_history_item,
             commands::get_autostart,
@@ -56,12 +72,16 @@ pub fn run() {
             commands::open_control_panel,
             commands::open_original_image,
             commands::open_preview,
+            commands::open_screenshot_selector,
             commands::open_storage,
             commands::close_preview,
+            commands::paste_clipboard_to_input_panel,
             commands::poll_clipboard,
             commands::read_image_data_url,
             commands::recall_pet,
+            commands::resize_input_panel,
             commands::set_autostart,
+            commands::show_file_info,
             commands::toggle_pin_clipboard_history_item,
             commands::save_pet_position,
             commands::set_panel_visibility,
@@ -109,6 +129,12 @@ pub fn run() {
                     eprintln!("[setup] failed to register {STORAGE_SHORTCUT}: {err}")
                 }
             }
+            match handle.global_shortcut().register(SCREENSHOT_SHORTCUT) {
+                Ok(_) => println!("[setup] registered global shortcut {SCREENSHOT_SHORTCUT}"),
+                Err(err) => {
+                    eprintln!("[setup] failed to register {SCREENSHOT_SHORTCUT}: {err}")
+                }
+            }
 
             windows::build_main_window(handle, position)?;
             windows::build_all_panel_windows(handle, position)?;
@@ -118,6 +144,47 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let WindowEvent::DragDrop(drag_event) = event {
+                    match drag_event {
+                        DragDropEvent::Enter { paths, .. } => {
+                            if !paths.is_empty() {
+                                let _ = window.app_handle().emit_to(
+                                    "main",
+                                    "file-drag-state",
+                                    FileDragStatePayload { active: true },
+                                );
+                            }
+                        }
+                        DragDropEvent::Over { .. } => {
+                            let _ = window.app_handle().emit_to(
+                                "main",
+                                "file-drag-state",
+                                FileDragStatePayload { active: true },
+                            );
+                        }
+                        DragDropEvent::Drop { paths, .. } => {
+                            let _ = window.app_handle().emit_to(
+                                "main",
+                                "file-drag-state",
+                                FileDragStatePayload { active: false },
+                            );
+                            if let Some(path) = paths.first() {
+                                commands::show_file_info_for_path(window.app_handle(), path);
+                            }
+                        }
+                        DragDropEvent::Leave => {
+                            let _ = window.app_handle().emit_to(
+                                "main",
+                                "file-drag-state",
+                                FileDragStatePayload { active: false },
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             // 全局聚焦管理：只有当本应用所有窗口都失焦时，才关闭面板/预览并让宠物回到等待态。
             if let WindowEvent::Focused(focused) = event {
                 let label = window.label().to_string();
@@ -166,7 +233,12 @@ pub fn run() {
                             "[main moved] outer=({}, {}), scale_factor={}, panel_open={panel_open}",
                             position.x, position.y, scale_factor
                         );
-                        windows::position_panels_around(handle, position.x, position.y, scale_factor);
+                        windows::position_panels_around(
+                            handle,
+                            position.x,
+                            position.y,
+                            scale_factor,
+                        );
                     }
                 }
             }
@@ -180,6 +252,8 @@ pub fn run() {
                     || label == "preview"
                     || label == "image-viewer"
                     || label == "control-panel"
+                    || label == "screenshot-selector"
+                    || label == "screenshot-result"
                     || label.starts_with("panel-")
                 {
                     println!("[window close requested] hide {label} instead of destroy");

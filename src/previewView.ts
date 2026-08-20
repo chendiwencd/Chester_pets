@@ -2,7 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { resolveImageSrc } from "./media";
 
-type PanelKind = "image" | "text" | "web";
+// note = 第三个面板手动输入的"记事本"条目，和来自剪贴板的 text/image 区分。
+type PanelKind = "image" | "text" | "web" | "note";
+
+const LAST_VIEWED_KEY = "desktop-shell.preview.last-viewed-id";
 
 interface PanelContentPayload {
   id?: number;
@@ -20,39 +23,36 @@ interface ClipboardHistoryItem {
   pinned_at_ms?: number | null;
 }
 
-type HistoryFilter = "all" | "text" | "image";
+type HistoryFilter = "all" | "text" | "image" | "note";
+
+interface SavedResourceSummary {
+  kind: "text" | "image";
+  name: string;
+  summary: string;
+  size?: string;
+}
+
+const NOTE_RESOURCE_MARKER = "[[desktop-shell:resources:v1]]";
 
 const FILTERS: Array<{ key: Exclude<HistoryFilter, "all">; title: string }> = [
   { key: "text", title: "文本" },
   { key: "image", title: "图片" },
+  { key: "note", title: "记事本" },
 ];
 
-function fitTextToContainer(text: HTMLElement, container: HTMLElement, minPx: number, maxPx: number) {
-  // 二分找最大可用字号（避免文字过小，同时不溢出）
-  let low = minPx;
-  let high = maxPx;
-  let best = minPx;
-
-  const fits = (px: number) => {
-    text.style.fontSize = `${px}px`;
-    // 让布局完成
-    // 使用 scroll 宽高判断是否溢出
-    return (
-      text.scrollHeight <= container.clientHeight + 1 &&
-      text.scrollWidth <= container.clientWidth + 1
-    );
-  };
-
-  while (low <= high) {
-    const mid = Math.floor((low + high) / 2);
-    if (fits(mid)) {
-      best = mid;
-      low = mid + 1;
-    } else {
-      high = mid - 1;
-    }
+function parseNoteWithResources(value: string): { text: string; resources: SavedResourceSummary[] } {
+  const parts = value.split(NOTE_RESOURCE_MARKER);
+  if (parts.length < 2) {
+    return { text: value.trim(), resources: [] };
   }
-  text.style.fontSize = `${best}px`;
+  const text = parts[0].trim();
+  const resourceJson = parts[1].trim();
+  try {
+    const resources = JSON.parse(resourceJson) as SavedResourceSummary[];
+    return { text, resources: Array.isArray(resources) ? resources : [] };
+  } catch {
+    return { text: value.trim(), resources: [] };
+  }
 }
 
 function renderContent(root: HTMLElement, kind: PanelKind, value: string): void {
@@ -74,16 +74,62 @@ function renderContent(root: HTMLElement, kind: PanelKind, value: string): void 
     return;
   }
 
+  if (kind === "note") {
+    const parsed = parseNoteWithResources(value);
+    if (parsed.resources.length > 0) {
+      const container = document.createElement("div");
+      container.className = "preview-note-container";
+
+      const resourcesBlock = document.createElement("div");
+      resourcesBlock.className = "preview-note-resources";
+      for (const resource of parsed.resources) {
+        const card = document.createElement("div");
+        card.className = `preview-note-resource-card preview-note-resource-${resource.kind}`;
+
+        const icon = document.createElement("span");
+        icon.className = `preview-note-resource-icon preview-note-resource-icon-${resource.kind}`;
+        icon.setAttribute("aria-hidden", "true");
+        if (resource.kind === "image") {
+          icon.appendChild(document.createElement("i"));
+        } else {
+          icon.appendChild(document.createElement("i"));
+        }
+
+        const info = document.createElement("div");
+        info.className = "preview-note-resource-info";
+
+        const name = document.createElement("div");
+        name.className = "preview-note-resource-name";
+        name.textContent = resource.name;
+
+        const summary = document.createElement("div");
+        summary.className = "preview-note-resource-summary";
+        summary.textContent = resource.summary;
+
+        info.appendChild(name);
+        info.appendChild(summary);
+        card.appendChild(icon);
+        card.appendChild(info);
+        resourcesBlock.appendChild(card);
+      }
+      container.appendChild(resourcesBlock);
+
+      if (parsed.text) {
+        const textBlock = document.createElement("div");
+        textBlock.className = "preview-note-text";
+        textBlock.textContent = parsed.text;
+        container.appendChild(textBlock);
+      }
+
+      root.appendChild(container);
+      return;
+    }
+  }
+
   const text = document.createElement("p");
-  // 预览态：整体居中，但文字块内部左对齐
   text.className = (kind === "web" ? "panel-web-link" : "panel-text") + " preview-text-block";
   text.textContent = value;
   root.appendChild(text);
-
-  // 预览窗允许更大的字号；太长的内容允许滚动，所以这里尽量放大到一个合理上限
-  requestAnimationFrame(() => {
-    fitTextToContainer(text, root, 13, 26);
-  });
 }
 
 // 时间戳按“距今远近”分档，越近显示得越省略：
@@ -108,14 +154,21 @@ function formatTime(ms: number): string {
   return `${d.getFullYear()}-${md} ${hm}`;
 }
 
-function createIcon(kind: "text" | "image", extraClass?: string): HTMLElement {
+function createIcon(kind: "text" | "image" | "note", extraClass?: string): HTMLElement {
   const icon = document.createElement("span");
   icon.className = `preview-symbol preview-symbol-${kind}${extraClass ? ` ${extraClass}` : ""}`;
   icon.setAttribute("aria-hidden", "true");
-  if (kind === "image") {
+  if (kind === "image" || kind === "note") {
     icon.appendChild(document.createElement("i"));
   }
   return icon;
+}
+
+// 历史条目按类别归组：图片 / 记事本(手动输入) / 文本(剪贴板文本或链接)。
+function groupOf(kind: PanelKind): "image" | "note" | "text" {
+  if (kind === "image") return "image";
+  if (kind === "note") return "note";
+  return "text";
 }
 
 function renderFilters(
@@ -150,6 +203,8 @@ function renderHistory(
     .filter((item) => {
     if (filter === "all") return true;
     if (filter === "image") return item.kind === "image";
+    if (filter === "note") return item.kind === "note";
+    // 文本：来自剪贴板的文本/链接，不含记事本
     return item.kind === "text" || item.kind === "web";
     })
     .sort((a, b) => {
@@ -170,10 +225,11 @@ function renderHistory(
   }
 
   for (const item of filtered) {
+    const group = groupOf(item.kind);
     const button = document.createElement("button");
     button.type = "button";
     button.className =
-      `preview-history-item group-${item.kind === "image" ? "image" : "text"}` +
+      `preview-history-item group-${group}` +
       (item.pinned ? " is-pinned" : "") +
       (item.id === activeId ? " is-active" : "");
 
@@ -181,8 +237,8 @@ function renderHistory(
     meta.className = "preview-history-meta";
 
     const iconWrap = document.createElement("span");
-    iconWrap.className = `preview-history-icon group-${item.kind === "image" ? "image" : "text"}`;
-    iconWrap.appendChild(createIcon(item.kind === "image" ? "image" : "text"));
+    iconWrap.className = `preview-history-icon group-${group}`;
+    iconWrap.appendChild(createIcon(group));
 
     const kind = document.createElement("span");
     kind.className = "preview-history-kind";
@@ -210,7 +266,13 @@ function renderHistory(
     if (item.kind !== "image") {
       const preview = document.createElement("span");
       preview.className = "preview-history-preview";
-      preview.textContent = item.preview || "(空)";
+      // 记事本条目只显示正文，不显示资源 JSON
+      if (item.kind === "note") {
+        const parsed = parseNoteWithResources(item.value);
+        preview.textContent = parsed.text || "(空)";
+      } else {
+        preview.textContent = item.preview || "(空)";
+      }
       button.appendChild(preview);
     }
 
@@ -231,6 +293,7 @@ export async function initPreviewView(root: HTMLElement): Promise<void> {
   let activeId: number | undefined;
   let activeFilter: HistoryFilter = "all";
   let deleteMode = false;
+  let monitorMode = false;
 
   const activeItem = () => history.find((item) => item.id === activeId);
 
@@ -258,25 +321,114 @@ export async function initPreviewView(root: HTMLElement): Promise<void> {
     renderContent(root, item.kind, item.value);
     renderHistoryList();
     syncActionButtons();
+    // 记住用户上次查看的记录
+    try {
+      localStorage.setItem(LAST_VIEWED_KEY, String(item.id));
+    } catch {
+      // ignore storage failures
+    }
+    // 滚动到选中的记录
+    requestAnimationFrame(() => {
+      if (historyRoot) {
+        const activeButton = historyRoot.querySelector(".preview-history-item.is-active");
+        if (activeButton instanceof HTMLElement) {
+          activeButton.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        }
+      }
+    });
   };
 
   const selectFilter = (filter: HistoryFilter) => {
+    if (!monitorMode) return; // 非监控模式下不支持切换筛选器
+
     activeFilter = filter;
     if (filterRoot) renderFilters(filterRoot, activeFilter, selectFilter);
-    renderHistoryList();
+
+    // 切换筛选器时，自动选中该分类下的第一条记录
+    const filtered = history.filter((item) => {
+      if (filter === "all") return true;
+      if (filter === "image") return item.kind === "image";
+      if (filter === "note") return item.kind === "note";
+      return item.kind === "text" || item.kind === "web";
+    }).sort((a, b) => {
+      const aPin = a.pinned ? 1 : 0;
+      const bPin = b.pinned ? 1 : 0;
+      if (aPin !== bPin) return bPin - aPin;
+      if (a.pinned && b.pinned) {
+        return (b.pinned_at_ms ?? 0) - (a.pinned_at_ms ?? 0);
+      }
+      return b.created_at_ms - a.created_at_ms;
+    });
+
+    if (filtered.length > 0 && !filtered.find(item => item.id === activeId)) {
+      // 如果当前选中的不在筛选结果中，自动选中第一条
+      selectItem(filtered[0]);
+    } else {
+      renderHistoryList();
+    }
   };
 
   await invoke("log_debug", {
     message: `[preview init] label=${appWindow.label}`,
   }).catch((err) => console.error("[previewView] log_debug failed", err));
 
+  monitorMode = await invoke<boolean>("get_monitor_mode").catch((err) => {
+    console.error("[previewView] get_monitor_mode failed", err);
+    return false;
+  });
+
   history = await invoke<ClipboardHistoryItem[]>("get_clipboard_history").catch((err) => {
     console.error("[previewView] get_clipboard_history failed", err);
     return [];
   });
-  if (filterRoot) renderFilters(filterRoot, activeFilter, selectFilter);
-  renderHistoryList();
-  syncActionButtons();
+
+  // 非监控模式下，只显示记事本分类
+  if (!monitorMode) {
+    history = history.filter((item) => item.kind === "note");
+    activeFilter = "note";
+  }
+
+  if (filterRoot) {
+    if (monitorMode) {
+      renderFilters(filterRoot, activeFilter, selectFilter);
+    } else {
+      filterRoot.style.display = "none";
+    }
+  }
+
+  // 初始化时尝试恢复上次查看的记录
+  if (history.length > 0) {
+    let itemToSelect: ClipboardHistoryItem | undefined;
+
+    // 1. 尝试加载上次查看的记录
+    try {
+      const lastViewedId = localStorage.getItem(LAST_VIEWED_KEY);
+      if (lastViewedId) {
+        itemToSelect = history.find((item) => item.id === Number(lastViewedId));
+      }
+    } catch {
+      // ignore storage failures
+    }
+
+    // 2. 如果上次查看的记录不存在（被删除或首次打开），选择第一条记录（置顶优先）
+    if (!itemToSelect) {
+      const sorted = [...history].sort((a, b) => {
+        const aPin = a.pinned ? 1 : 0;
+        const bPin = b.pinned ? 1 : 0;
+        if (aPin !== bPin) return bPin - aPin;
+        if (a.pinned && b.pinned) {
+          return (b.pinned_at_ms ?? 0) - (a.pinned_at_ms ?? 0);
+        }
+        return b.created_at_ms - a.created_at_ms;
+      });
+      itemToSelect = sorted[0];
+    }
+
+    selectItem(itemToSelect);
+  } else {
+    renderHistoryList();
+    syncActionButtons();
+  }
 
   clearBtn?.addEventListener("click", () => {
     deleteMode = !deleteMode;
@@ -343,6 +495,7 @@ export async function initPreviewView(root: HTMLElement): Promise<void> {
   });
 
   await appWindow.listen<ClipboardHistoryItem>("history-appended", (event) => {
+    if (!monitorMode && event.payload.kind !== "note") return; // 非监控模式下只接收记事本类型
     history = [...history, event.payload];
     renderHistoryList();
   });

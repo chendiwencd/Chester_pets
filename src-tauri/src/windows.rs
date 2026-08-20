@@ -8,29 +8,35 @@ use crate::state::PetPosition;
 pub const PET_SIZE: f64 = 120.0;
 // 和 public/pet/board.png 的原图比例(1600x900, 16:9)保持一致，避免 background-size:100% 100% 把木牌拉变形。
 // 窗口比例
-pub const PANEL_WIDTH: f64 = 240.0;
-pub const PANEL_HEIGHT: f64 = 160.0;
+pub const PANEL_WIDTH: f64 = 360.0;
+pub const PANEL_HEIGHT: f64 = 220.0;
 pub const PREVIEW_WIDTH: f64 = 800.0;
 pub const PREVIEW_HEIGHT: f64 = 450.0;
 pub const IMAGE_VIEWER_WIDTH: f64 = 1000.0;
 pub const IMAGE_VIEWER_HEIGHT: f64 = 700.0;
 pub const CONTROL_PANEL_WIDTH: f64 = 980.0;
 pub const CONTROL_PANEL_HEIGHT: f64 = 640.0;
+pub const SCREENSHOT_RESULT_WIDTH: f64 = 760.0;
+pub const SCREENSHOT_RESULT_HEIGHT: f64 = 460.0;
+
+#[derive(Clone, Copy)]
+pub struct ScreenRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
 
 #[derive(Clone, Copy)]
 pub enum PanelKind {
-    Image,
-    Text,
     Web,
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 3] = [PanelKind::Image, PanelKind::Text, PanelKind::Web];
+    pub const ALL: [PanelKind; 1] = [PanelKind::Web];
 
     pub fn label(self) -> &'static str {
         match self {
-            PanelKind::Image => "panel-img",
-            PanelKind::Text => "panel-text",
             PanelKind::Web => "panel-web",
         }
     }
@@ -220,15 +226,18 @@ pub fn build_image_viewer_window(app: &AppHandle) -> tauri::Result<WebviewWindow
     println!(
         "[windows] build image-viewer size=({IMAGE_VIEWER_WIDTH}, {IMAGE_VIEWER_HEIGHT}) visible=false resizable=true"
     );
-    let window =
-        WebviewWindowBuilder::new(app, "image-viewer", WebviewUrl::App("image-viewer.html".into()))
-            .title("查看原图")
-            .inner_size(IMAGE_VIEWER_WIDTH, IMAGE_VIEWER_HEIGHT)
-            .always_on_top(true)
-            .resizable(true)
-            .skip_taskbar(true)
-            .visible(false)
-            .build()?;
+    let window = WebviewWindowBuilder::new(
+        app,
+        "image-viewer",
+        WebviewUrl::App("image-viewer.html".into()),
+    )
+    .title("查看原图")
+    .inner_size(IMAGE_VIEWER_WIDTH, IMAGE_VIEWER_HEIGHT)
+    .always_on_top(true)
+    .resizable(true)
+    .skip_taskbar(true)
+    .visible(false)
+    .build()?;
     Ok(window)
 }
 
@@ -249,6 +258,46 @@ pub fn build_control_panel_window(app: &AppHandle) -> tauri::Result<WebviewWindo
     .build()?;
     let _ = window.center();
     Ok(window)
+}
+
+pub fn build_screenshot_selector_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
+    println!("[windows] build screenshot-selector visible=false");
+    WebviewWindowBuilder::new(
+        app,
+        "screenshot-selector",
+        WebviewUrl::App("screenshot-selector.html".into()),
+    )
+    .title("截图选区")
+    .inner_size(100.0, 100.0)
+    .decorations(false)
+    .always_on_top(true)
+    .resizable(false)
+    .skip_taskbar(true)
+    .shadow(false)
+    .transparent(true)
+    .visible(false)
+    .build()
+}
+
+pub fn build_screenshot_result_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
+    println!(
+        "[windows] build screenshot-result size=({SCREENSHOT_RESULT_WIDTH}, {SCREENSHOT_RESULT_HEIGHT}) visible=false"
+    );
+    WebviewWindowBuilder::new(
+        app,
+        "screenshot-result",
+        WebviewUrl::App("screenshot-result.html".into()),
+    )
+    .title("截图 OCR")
+    .inner_size(SCREENSHOT_RESULT_WIDTH, SCREENSHOT_RESULT_HEIGHT)
+    .decorations(false)
+    .always_on_top(true)
+    .resizable(false)
+    .skip_taskbar(true)
+    .shadow(false)
+    .transparent(false)
+    .visible(false)
+    .build()
 }
 
 pub fn show_control_panel(app: &AppHandle) -> tauri::Result<()> {
@@ -300,6 +349,12 @@ pub fn build_all_panel_windows(app: &AppHandle, _position: PetPosition) -> tauri
     if app.get_webview_window("control-panel").is_none() {
         let _ = build_control_panel_window(app)?;
     }
+    if app.get_webview_window("screenshot-selector").is_none() {
+        let _ = build_screenshot_selector_window(app)?;
+    }
+    if app.get_webview_window("screenshot-result").is_none() {
+        let _ = build_screenshot_result_window(app)?;
+    }
     Ok(())
 }
 
@@ -346,7 +401,15 @@ pub fn position_preview(window: &WebviewWindow, main_x: i32, main_y: i32, main_s
     let dx = -((PREVIEW_WIDTH as i32 - PET_SIZE as i32) / 2);
     let dy = -(GAP + PREVIEW_HEIGHT as i32);
     place_child(
-        window, main_x, main_y, main_scale, dx, dy, PREVIEW_WIDTH, PREVIEW_HEIGHT, "preview",
+        window,
+        main_x,
+        main_y,
+        main_scale,
+        dx,
+        dy,
+        PREVIEW_WIDTH,
+        PREVIEW_HEIGHT,
+        "preview",
     );
 }
 
@@ -367,20 +430,103 @@ pub fn position_image_viewer(window: &WebviewWindow, main_x: i32, main_y: i32, m
     );
 }
 
+pub fn position_screenshot_result(app: &AppHandle, rect: ScreenRect) {
+    let Some(window) = app.get_webview_window("screenshot-result") else {
+        return;
+    };
+    let size = window.outer_size().unwrap_or(PhysicalSize::new(
+        SCREENSHOT_RESULT_WIDTH as u32,
+        SCREENSHOT_RESULT_HEIGHT as u32,
+    ));
+    let result_w = size.width as i32;
+    let result_h = size.height as i32;
+    let gap = 12;
+    let rect_w = rect.width as i32;
+    let rect_h = rect.height as i32;
+    let monitor = pick_monitor_bounds(
+        app,
+        PhysicalPosition::new(rect.x, rect.y),
+        PhysicalSize::new(rect.width.max(1), rect.height.max(1)),
+    )
+    .unwrap_or((rect.x, rect.y, rect_w.max(result_w), rect_h.max(result_h)));
+
+    let candidates = [
+        (rect.x + rect_w + gap, rect.y),
+        (rect.x - result_w - gap, rect.y),
+        (rect.x, rect.y + rect_h + gap),
+        (rect.x, rect.y - result_h - gap),
+    ];
+    let fits = |(x, y): (i32, i32)| -> bool {
+        x >= monitor.0
+            && y >= monitor.1
+            && x + result_w <= monitor.0 + monitor.2
+            && y + result_h <= monitor.1 + monitor.3
+    };
+    let (x, y) = candidates
+        .iter()
+        .copied()
+        .find(|&candidate| fits(candidate))
+        .unwrap_or(candidates[0]);
+    let clamped = clamp_to_visible_area(app, PhysicalPosition::new(x, y), size);
+    let _ = window.set_position(clamped);
+}
+
+pub fn show_screenshot_selector(app: &AppHandle) -> tauri::Result<()> {
+    let window = match app.get_webview_window("screenshot-selector") {
+        Some(existing) => existing,
+        None => build_screenshot_selector_window(app)?,
+    };
+
+    let cursor = app
+        .cursor_position()
+        .unwrap_or(PhysicalPosition::new(0.0, 0.0));
+    let monitors = app.available_monitors().unwrap_or_default();
+    let primary_name = app
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .and_then(|monitor| monitor.name().cloned());
+    let selected = monitors
+        .iter()
+        .find(|monitor| {
+            let pos = monitor.position();
+            let size = monitor.size();
+            cursor.x >= pos.x as f64
+                && cursor.y >= pos.y as f64
+                && cursor.x < (pos.x + size.width as i32) as f64
+                && cursor.y < (pos.y + size.height as i32) as f64
+        })
+        .or_else(|| {
+            monitors
+                .iter()
+                .find(|monitor| monitor.name() == primary_name.as_ref())
+        })
+        .or_else(|| monitors.first());
+
+    if let Some(monitor) = selected {
+        let pos = monitor.position();
+        let size = monitor.size();
+        let _ = window.set_position(*pos);
+        let _ = window.set_size(*size);
+    }
+    let _ = window.show();
+    let _ = window.set_focus();
+    Ok(())
+}
+
 // 同时摆放三个面板，并做"屏幕边界翻转"：
 // 每个面板有一组按优先级排列的候选侧(上/下/左/右)，从中挑第一个「未被别的面板占用且在宠物所在屏
 // 完整放得下」的侧；靠边导致首选侧放不下时会自动翻到另一侧，几个面板各占一侧，既不会盖住宠物、
 // 也不会互相重叠，且始终整块可见。main_x/main_y 为宠物物理坐标，main_scale 为宠物所在屏缩放。
 pub fn position_panels_around(app: &AppHandle, main_x: i32, main_y: i32, main_scale: f64) {
     // 宠物物理尺寸（优先读真实窗口尺寸，读不到再按逻辑尺寸×缩放估算）
-    let (pet_w, pet_h) = app
-        .get_webview_window("main")
-        .and_then(|w| w.outer_size().ok())
-        .map(|s| (s.width as i32, s.height as i32))
-        .unwrap_or(((PET_SIZE * main_scale) as i32, (PET_SIZE * main_scale) as i32));
+    let (pet_w, pet_h) = (
+        (PET_SIZE * main_scale).round() as i32,
+        (PET_SIZE * main_scale).round() as i32,
+    );
     // 面板物理尺寸（三个同尺寸）
     let (pan_w, pan_h) = app
-        .get_webview_window("panel-img")
+        .get_webview_window("panel-web")
         .and_then(|w| w.outer_size().ok())
         .map(|s| (s.width as i32, s.height as i32))
         .unwrap_or((
@@ -411,11 +557,7 @@ pub fn position_panels_around(app: &AppHandle, main_x: i32, main_y: i32, main_sc
     };
 
     // 面板 -> 候选侧优先级。图片默认左、文本默认上、网页默认右；放不下时优先翻到"下"，再上/另一侧。
-    let prefs: [(PanelKind, [u8; 4]); 3] = [
-        (PanelKind::Image, [0, 3, 2, 1]),
-        (PanelKind::Text, [2, 3, 1, 0]),
-        (PanelKind::Web, [1, 3, 2, 0]),
-    ];
+    let prefs: [(PanelKind, [u8; 4]); 1] = [(PanelKind::Web, [1, 3, 2, 0])];
     let mut taken = [false; 4];
     for (kind, order) in prefs {
         // 优先：未占用且完整放得下；退一步：仅未占用(允许被钳制)；再退：首选侧。

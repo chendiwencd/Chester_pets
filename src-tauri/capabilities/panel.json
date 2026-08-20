@@ -1,12 +1,21 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "panel",
-  "description": "Capability for the 3 floating content panels (image/text/web)",
-  "windows": ["panel-*", "preview", "image-viewer", "control-panel"],
+  "description": "Capability for floating content windows",
+  "windows": [
+    "panel-*",
+    "preview",
+    "image-viewer",
+    "control-panel",
+    "screenshot-selector",
+    "screenshot-result"
+  ],
   "permissions": [
     "core:default",
     "core:event:allow-listen",
     "core:window:allow-hide",
+    "core:window:allow-outer-position",
+    "core:window:allow-scale-factor",
     "core:window:allow-start-dragging"
   ]
 }

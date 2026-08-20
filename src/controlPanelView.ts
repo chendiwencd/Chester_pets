@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { authStore } from "./authStore";
 
 type SectionKey = "personal" | "pet" | "settings";
+type AuthMode = "login" | "register";
 
 // 开关行：左侧标题+说明，右侧一个可点击的开关。initial 决定初始状态，
 // onChange 返回“落地后的真实状态”（命令可能失败），据此回写 UI，避免 UI 和系统实际状态不一致。
@@ -96,38 +98,209 @@ function renderPersonalSection(content: HTMLElement): void {
   const grid = document.createElement("div");
   grid.className = "control-panel-card-grid";
 
-  const loginCard = document.createElement("section");
-  loginCard.className = "control-panel-card";
-  loginCard.innerHTML = `
-    <h2 class="control-panel-card-title">登录页</h2>
-    <div class="control-panel-form">
-      <label class="control-panel-field">
-        <span>账号</span>
-        <input type="text" placeholder="预留" disabled />
-      </label>
-      <label class="control-panel-field">
-        <span>密码</span>
-        <input type="password" placeholder="预留" disabled />
-      </label>
-      <button type="button" class="control-panel-primary-button" disabled>登录</button>
-    </div>
-  `;
+  const authState = authStore.getState();
 
+  // 认证卡片
+  const authCard = document.createElement("section");
+  authCard.className = "control-panel-card";
+
+  if (!authState.onlineMode) {
+    authCard.innerHTML = `
+      <h2 class="control-panel-card-title">离线模式</h2>
+      <p class="control-panel-muted">当前为离线模式，请在设置中启用在线模式后登录。</p>
+    `;
+  } else if (authState.isLoggedIn && authState.user) {
+    // 已登录状态
+    const cardTitle = document.createElement("h2");
+    cardTitle.className = "control-panel-card-title";
+    cardTitle.textContent = "账号管理";
+
+    const logoutButton = document.createElement("button");
+    logoutButton.type = "button";
+    logoutButton.className = "control-panel-primary-button";
+    logoutButton.textContent = "退出登录";
+    logoutButton.addEventListener("click", async () => {
+      logoutButton.disabled = true;
+      logoutButton.textContent = "退出中...";
+      try {
+        await authStore.logout();
+        renderPersonalSection(content);
+      } catch (err) {
+        console.error("[controlPanelView] logout failed", err);
+        alert(`退出失败: ${err instanceof Error ? err.message : String(err)}`);
+        logoutButton.disabled = false;
+        logoutButton.textContent = "退出登录";
+      }
+    });
+
+    authCard.append(cardTitle, logoutButton);
+  } else {
+    // 未登录状态：显示登录/注册表单
+    let mode: AuthMode = "login";
+
+    const renderAuthForm = () => {
+      authCard.innerHTML = "";
+
+      const cardTitle = document.createElement("h2");
+      cardTitle.className = "control-panel-card-title";
+      cardTitle.textContent = mode === "login" ? "登录" : "注册";
+
+      const form = document.createElement("div");
+      form.className = "control-panel-form";
+
+      if (mode === "register") {
+        const emailField = document.createElement("label");
+        emailField.className = "control-panel-field";
+        emailField.innerHTML = `
+          <span>邮箱</span>
+          <input type="email" id="auth-email" placeholder="your@email.com" required />
+        `;
+
+        const usernameField = document.createElement("label");
+        usernameField.className = "control-panel-field";
+        usernameField.innerHTML = `
+          <span>用户名</span>
+          <input type="text" id="auth-username" placeholder="用户名（3-50字符）" required />
+        `;
+
+        const passwordField = document.createElement("label");
+        passwordField.className = "control-panel-field";
+        passwordField.innerHTML = `
+          <span>密码</span>
+          <input type="password" id="auth-password" placeholder="密码（至少8位）" required />
+        `;
+
+        form.append(emailField, usernameField, passwordField);
+      } else {
+        const identifierField = document.createElement("label");
+        identifierField.className = "control-panel-field";
+        identifierField.innerHTML = `
+          <span>账号</span>
+          <input type="text" id="auth-identifier" placeholder="用户名或邮箱" required />
+        `;
+
+        const passwordField = document.createElement("label");
+        passwordField.className = "control-panel-field";
+        passwordField.innerHTML = `
+          <span>密码</span>
+          <input type="password" id="auth-password" placeholder="密码" required />
+        `;
+
+        form.append(identifierField, passwordField);
+      }
+
+      const submitButton = document.createElement("button");
+      submitButton.type = "button";
+      submitButton.className = "control-panel-primary-button";
+      submitButton.textContent = mode === "login" ? "登录" : "注册";
+
+      submitButton.addEventListener("click", async () => {
+        submitButton.disabled = true;
+        const originalText = submitButton.textContent;
+        submitButton.textContent = mode === "login" ? "登录中..." : "注册中...";
+
+        try {
+          if (mode === "register") {
+            const email = (document.getElementById("auth-email") as HTMLInputElement).value;
+            const username = (document.getElementById("auth-username") as HTMLInputElement).value;
+            const password = (document.getElementById("auth-password") as HTMLInputElement).value;
+
+            if (!email || !username || !password) {
+              throw new Error("请填写完整信息");
+            }
+
+            await authStore.accountRegister(email, username, password);
+          } else {
+            const identifier = (document.getElementById("auth-identifier") as HTMLInputElement).value;
+            const password = (document.getElementById("auth-password") as HTMLInputElement).value;
+
+            if (!identifier || !password) {
+              throw new Error("请填写账号和密码");
+            }
+
+            await authStore.accountLogin(identifier, password);
+          }
+
+          renderPersonalSection(content);
+        } catch (err) {
+          console.error(`[controlPanelView] ${mode} failed`, err);
+          alert(`${mode === "login" ? "登录" : "注册"}失败: ${err instanceof Error ? err.message : String(err)}`);
+          submitButton.disabled = false;
+          submitButton.textContent = originalText;
+        }
+      });
+
+      const switchButton = document.createElement("button");
+      switchButton.type = "button";
+      switchButton.className = "control-panel-link-button";
+      switchButton.textContent = mode === "login" ? "没有账号？前往注册" : "已有账号？返回登录";
+      switchButton.addEventListener("click", () => {
+        mode = mode === "login" ? "register" : "login";
+        renderAuthForm();
+      });
+
+      form.append(submitButton, switchButton);
+      authCard.append(cardTitle, form);
+    };
+
+    renderAuthForm();
+  }
+
+  // 个人信息卡片
   const profileCard = document.createElement("section");
   profileCard.className = "control-panel-card";
-  profileCard.innerHTML = `
-    <h2 class="control-panel-card-title">个人信息</h2>
-    <div class="control-panel-profile">
-      <div class="control-panel-avatar">ME</div>
-      <div class="control-panel-profile-list">
-        <div><span>昵称</span><strong>预留</strong></div>
-        <div><span>邮箱</span><strong>预留</strong></div>
-        <div><span>状态</span><strong>未登录</strong></div>
-      </div>
-    </div>
-  `;
 
-  grid.append(loginCard, profileCard);
+  const profileTitle = document.createElement("h2");
+  profileTitle.className = "control-panel-card-title";
+  profileTitle.textContent = "个人信息";
+
+  const profileContent = document.createElement("div");
+  profileContent.className = "control-panel-profile";
+
+  if (authState.isLoggedIn && authState.user) {
+    const avatarInitial = authState.user.username.charAt(0).toUpperCase();
+    const avatar = document.createElement("div");
+    avatar.className = "control-panel-avatar";
+    avatar.textContent = avatarInitial;
+
+    const profileList = document.createElement("div");
+    profileList.className = "control-panel-profile-list";
+
+    const usernameRow = document.createElement("div");
+    usernameRow.innerHTML = `<span>昵称</span><strong>${authState.user.username}</strong>`;
+
+    const emailRow = document.createElement("div");
+    emailRow.innerHTML = `<span>邮箱</span><strong>${authState.user.email || "未设置"}</strong>`;
+
+    const phoneRow = document.createElement("div");
+    phoneRow.innerHTML = `<span>手机</span><strong>${authState.user.phone || "未绑定"}</strong>`;
+
+    const statusRow = document.createElement("div");
+    const statusBadge = authState.user.is_vip
+      ? '<span class="control-panel-vip-badge">VIP</span>'
+      : '<strong>已登录</strong>';
+    statusRow.innerHTML = `<span>状态</span>${statusBadge}`;
+
+    profileList.append(usernameRow, emailRow, phoneRow, statusRow);
+    profileContent.append(avatar, profileList);
+  } else {
+    const avatar = document.createElement("div");
+    avatar.className = "control-panel-avatar";
+    avatar.textContent = "?";
+
+    const profileList = document.createElement("div");
+    profileList.className = "control-panel-profile-list";
+    profileList.innerHTML = `
+      <div><span>昵称</span><strong>未登录</strong></div>
+      <div><span>邮箱</span><strong>--</strong></div>
+      <div><span>状态</span><strong>离线</strong></div>
+    `;
+
+    profileContent.append(avatar, profileList);
+  }
+
+  profileCard.append(profileTitle, profileContent);
+  grid.append(authCard, profileCard);
   content.append(title, grid);
 }
 
@@ -136,7 +309,7 @@ function renderPetSection(content: HTMLElement): void {
 
   const title = document.createElement("h1");
   title.className = "control-panel-title";
-  title.textContent = "宠物信息";
+  title.textContent = "宠物日记";
 
   const card = document.createElement("section");
   card.className = "control-panel-card";
@@ -160,6 +333,20 @@ async function renderSettingsSection(content: HTMLElement): Promise<void> {
   const card = document.createElement("section");
   card.className = "control-panel-card control-panel-settings-card";
 
+  // 在线模式开关
+  const authState = authStore.getState();
+  card.append(
+    createToggleRow(
+      "在线模式",
+      "启用后可登录账号，使用云端功能；关闭则为离线模式。",
+      authState.onlineMode,
+      async (next) => {
+        authStore.setOnlineMode(next);
+        return next;
+      },
+    ),
+  );
+
   // 开机自启：默认关。初始状态从后端(系统注册表实际状态)读，切换后回写真实结果。
   let autostartInitial = false;
   try {
@@ -177,10 +364,10 @@ async function renderSettingsSection(content: HTMLElement): Promise<void> {
   );
 
   card.append(
-    createPlaceholderRow("清空记忆", "保留项，后续用于清理历史与记忆数据。"),
-    createPlaceholderRow("记忆导出", "保留项，后续用于导出本地记忆内容。"),
-    createPlaceholderRow("形成记忆", "保留项，后续用于整理与生成结构化记忆。"),
-    createPlaceholderRow("导入记忆", "保留项，后续用于导入外部记忆数据。"),
+    createPlaceholderRow("清空记忆", "同时清空本地与云端形成的记忆。"),
+    createPlaceholderRow("记忆导出", "导出生成的记忆内容。"),
+    createPlaceholderRow("形成记忆", "整理与生成结构化记忆。"),
+    createPlaceholderRow("导入记忆", "用于导入外部记忆数据。"),
   );
 
   content.append(title, card);
@@ -226,7 +413,7 @@ export async function initControlPanelView(root: HTMLElement): Promise<void> {
         activeSection = "personal";
         render();
       }),
-      createNavButton("宠物信息", activeSection === "pet", () => {
+      createNavButton("宠物日记", activeSection === "pet", () => {
         activeSection = "pet";
         render();
       }),

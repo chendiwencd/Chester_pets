@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>截图 OCR</title>
+    <script type="module" src="/src/screenshotResultMain.ts" defer></script>
+  </head>
+  <body>
+    <main id="screenshot-result-root" class="screenshot-result-root">
+      <section class="screenshot-image-panel">
+        <img id="screenshot-image" class="screenshot-image" alt="" />
+      </section>
+      <section class="screenshot-side-panel">
+        <textarea id="screenshot-ocr-text" class="screenshot-ocr-text" aria-label="OCR 结果"></textarea>
+        <div id="screenshot-toolbar" class="screenshot-toolbar" aria-label="截图工具栏">
+          <button class="screenshot-tool-button" type="button" disabled>Rect</button>
+          <button class="screenshot-tool-button" type="button" disabled>Arrow</button>
+          <button class="screenshot-tool-button" type="button" disabled>Text</button>
+          <button class="screenshot-tool-button" type="button" disabled>Save</button>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

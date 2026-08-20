@@ -12,6 +12,6 @@ export class TextRenderer implements PetRenderer {
   constructor(private readonly root: HTMLElement) {}
 
   render(status: PetStatus): void {
-    this.root.textContent = STATUS_TEXT[status];
+    this.root.textContent = STATUS_TEXT[status] ?? status;
   }
 }

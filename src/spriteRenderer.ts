@@ -6,6 +6,7 @@ const STATUS_ASSET: Record<PetStatus, string> = {
   open: "/pet/open.gif",
   moving: "/pet/moving.gif",
   sleep: "/pet/sleep_loop.gif",
+  waitting_file: "/pet/open.gif",
 };
 
 // 读取 public/pet/*.gif（约定见该目录下的 README.md）。moving 状态左右共用同一张侧面视角的图，

@@ -26,5 +26,9 @@ pub fn apply_monitor_mode(app: &AppHandle, enabled: bool) {
     let _ = save_settings(app, &settings);
     let _ = tray::refresh_tray_menu(app);
     let _ = app.emit("monitor-mode-changed", MonitorModePayload { enabled });
-    let _ = app.emit_to("control-panel", "monitor-mode-changed", MonitorModePayload { enabled });
+    let _ = app.emit_to(
+        "control-panel",
+        "monitor-mode-changed",
+        MonitorModePayload { enabled },
+    );
 }

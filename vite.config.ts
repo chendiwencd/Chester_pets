@@ -23,6 +23,8 @@ export default defineConfig(async () => ({
         preview: resolve(rootDir, "preview.html"),
         imageViewer: resolve(rootDir, "image-viewer.html"),
         controlPanel: resolve(rootDir, "control-panel.html"),
+        screenshotSelector: resolve(rootDir, "screenshot-selector.html"),
+        screenshotResult: resolve(rootDir, "screenshot-result.html"),
       },
     },
   },

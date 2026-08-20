@@ -1,32 +1,13 @@
+use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::thread;
 use std::time::Duration;
-use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 use crate::state::{images_dir, save_history, AppState, ClipboardHistoryItem, ClipboardSignatures};
-
-#[derive(Clone, serde::Serialize)]
-struct PanelContent {
-    id: u64,
-    kind: &'static str,
-    value: String,
-}
-
-fn emit_panel_content(app: &AppHandle, target: &str, id: u64, kind: &'static str, value: String) {
-    let _ = app.emit_to(
-        target,
-        "panel-content",
-        PanelContent {
-            id,
-            kind,
-            value,
-        },
-    );
-}
 
 fn preview_text(kind: &'static str, value: &str) -> String {
     if kind == "image" {
@@ -42,11 +23,15 @@ fn preview_text(kind: &'static str, value: &str) -> String {
     }
 }
 
-fn append_history(app: &AppHandle, kind: &'static str, value: String) -> u64 {
+// value 对 image 是文件路径(.png)，对 text/note 是内联文本内容。
+pub(crate) fn append_history(app: &AppHandle, kind: &'static str, value: String) -> u64 {
     let state = app.state::<AppState>();
     {
         let history = state.clipboard_history.lock().unwrap();
-        if let Some(existing) = history.iter().find(|item| item.kind == kind && item.value == value) {
+        if let Some(existing) = history
+            .iter()
+            .find(|item| item.kind == kind && item.value == value)
+        {
             return existing.id;
         }
     }
@@ -91,8 +76,10 @@ fn append_history(app: &AppHandle, kind: &'static str, value: String) -> u64 {
     id
 }
 
+// 第三个面板(带输入框)手动输入的内容，作为独立的 "note"(记事本) 类别存入历史，
+// 在存储区里与来自剪贴板的 "text"/"image" 区分显示。
 pub fn append_manual_text_history(app: &AppHandle, value: String) -> u64 {
-    append_history(app, "text", value)
+    append_history(app, "note", value)
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -113,8 +100,7 @@ fn try_forward_image(app: &AppHandle, sig: &mut ClipboardSignatures) -> bool {
         return true;
     }
 
-    let Some(buffer) = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, rgba)
-    else {
+    let Some(buffer) = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, rgba) else {
         return false;
     };
 
@@ -137,14 +123,16 @@ fn try_forward_image(app: &AppHandle, sig: &mut ClipboardSignatures) -> bool {
     let path = dir.join(&file_name);
     if !path.exists() {
         if let Err(err) = std::fs::write(&path, &png_bytes) {
-            eprintln!("[clipboard] failed to write image file {}: {err}", path.display());
+            eprintln!(
+                "[clipboard] failed to write image file {}: {err}",
+                path.display()
+            );
             return false;
         }
     }
     let path_str = path.to_string_lossy().to_string();
 
-    let id = append_history(app, "image", path_str.clone());
-    emit_panel_content(app, "panel-img", id, "image", path_str);
+    append_history(app, "image", path_str);
     sig.image = Some(signature);
     true
 }
@@ -158,23 +146,24 @@ fn try_forward_text(app: &AppHandle, sig: &mut ClipboardSignatures) {
         return;
     }
 
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        let signature = format!("web:{trimmed}");
-        if sig.web.as_ref() == Some(&signature) {
-            return;
-        }
-        let value = trimmed.to_string();
-        let id = append_history(app, "text", value.clone());
-        emit_panel_content(app, "panel-text", id, "text", value);
+    // 来自剪贴板的文本/链接都作为 "text" 类别，内联存储。
+    let is_web = trimmed.starts_with("http://") || trimmed.starts_with("https://");
+    let signature = if is_web {
+        format!("web:{trimmed}")
+    } else {
+        format!("text:{trimmed}")
+    };
+    let already = if is_web { &sig.web } else { &sig.text };
+    if already.as_ref() == Some(&signature) {
+        return;
+    }
+
+    let value = trimmed.to_string();
+    append_history(app, "text", value);
+
+    if is_web {
         sig.web = Some(signature);
     } else {
-        let signature = format!("text:{trimmed}");
-        if sig.text.as_ref() == Some(&signature) {
-            return;
-        }
-        let value = trimmed.to_string();
-        let id = append_history(app, "text", value.clone());
-        emit_panel_content(app, "panel-text", id, "text", value);
         sig.text = Some(signature);
     }
 }
