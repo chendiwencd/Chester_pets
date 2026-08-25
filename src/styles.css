@@ -1279,7 +1279,7 @@ body {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto minmax(110px, 0.8fr) minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 8px;
 }
 
@@ -1319,6 +1319,12 @@ body {
   opacity: 0.78;
 }
 
+.screenshot-tool-button.is-active {
+  border-color: rgba(241, 197, 160, 0.7);
+  background: rgba(241, 197, 160, 0.22);
+  color: #ffffff;
+}
+
 .screenshot-ocr-text {
   min-width: 0;
   min-height: 0;
@@ -1336,6 +1342,16 @@ body {
   -webkit-user-select: text;
 }
 
+.screenshot-text-stage {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+}
+
+.screenshot-text-stage > .screenshot-ocr-text {
+  grid-area: 1 / 1;
+}
+
 .screenshot-knowledge-panel {
   min-width: 0;
   min-height: 0;
@@ -1345,6 +1361,43 @@ body {
   border-radius: 8px;
   padding: 10px;
   background: rgba(10, 12, 14, 0.82);
+}
+
+.screenshot-knowledge-panel[hidden] {
+  display: none;
+}
+
+.screenshot-knowledge-panel.is-visible {
+  animation: screenshot-knowledge-rise 220ms ease-out both;
+}
+
+.screenshot-translation-text {
+  width: 100%;
+  height: calc(100% - 28px);
+  min-height: 80px;
+  resize: none;
+  box-sizing: border-box;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.94);
+  color: #202329;
+  font: inherit;
+  line-height: 1.45;
+  outline: none;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+@keyframes screenshot-knowledge-rise {
+  from {
+    opacity: 0;
+    transform: translateY(28px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .screenshot-knowledge-panel h2 {

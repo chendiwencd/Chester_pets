@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::image::Image;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -730,6 +731,68 @@ pub fn add_text_history_item(app: AppHandle, value: String) -> Option<u64> {
     }
     let id = crate::clipboard::append_manual_text_history(&app, trimmed.to_string());
     Some(id)
+}
+
+#[tauri::command]
+pub fn copy_text_to_clipboard(app: AppHandle, value: String) {
+    let _ = app.clipboard().write_text(value);
+}
+
+#[tauri::command]
+pub fn save_screenshot_note(
+    app: AppHandle,
+    image_data_url: String,
+    ocr_text: String,
+) -> Result<u64, String> {
+    let (_, encoded) = image_data_url
+        .split_once(',')
+        .ok_or_else(|| "截图数据格式无效".to_string())?;
+    let png_bytes = STANDARD
+        .decode(encoded.trim())
+        .map_err(|err| format!("截图数据解码失败：{err}"))?;
+    if png_bytes.is_empty() {
+        return Err("截图数据为空".to_string());
+    }
+
+    let dir = images_dir(&app).ok_or_else(|| "无法创建图片存储目录".to_string())?;
+    let file_name = format!("screenshot-{}.png", hash_bytes(&png_bytes));
+    let path = dir.join(&file_name);
+    if !path.exists() {
+        std::fs::write(&path, &png_bytes)
+            .map_err(|err| format!("图片保存失败：{err}"))?;
+    }
+
+    let path_string = path.to_string_lossy().to_string();
+    let summary = ocr_text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let summary = if summary.is_empty() {
+        "截图".to_string()
+    } else {
+        summary.chars().take(120).collect()
+    };
+    let resources = json!([{
+        "kind": "image",
+        "name": file_name,
+        "summary": summary,
+        "size": format_file_size(png_bytes.len() as u64),
+        "value": path_string,
+    }]);
+
+    let mut sections = Vec::new();
+    let trimmed_ocr = ocr_text.trim();
+    if !trimmed_ocr.is_empty() {
+        sections.push(trimmed_ocr.to_string());
+    }
+    sections.push(format!(
+        "[[desktop-shell:resources:v1]]\n{}",
+        resources
+    ));
+    Ok(crate::clipboard::append_manual_text_history(
+        &app,
+        sections.join("\n\n"),
+    ))
 }
 
 #[tauri::command]

@@ -19,18 +19,24 @@
       <section class="screenshot-side-panel">
         <div class="screenshot-result-content">
           <div id="screenshot-ocr-status" class="screenshot-ocr-status" role="status">等待截图</div>
-          <textarea id="screenshot-ocr-text" class="screenshot-ocr-text" aria-label="OCR 结果"></textarea>
-          <section class="screenshot-knowledge-panel" aria-label="相关科普">
+          <div class="screenshot-text-stage">
+            <textarea id="screenshot-ocr-text" class="screenshot-ocr-text" aria-label="OCR 结果"></textarea>
+          </div>
+          <section id="screenshot-knowledge-panel" class="screenshot-knowledge-panel" aria-label="更多信息" hidden>
             <h2>更多信息</h2>
             <div id="screenshot-knowledge" class="screenshot-knowledge"></div>
+          </section>
+          <section id="screenshot-translation-panel" class="screenshot-knowledge-panel screenshot-translation-panel" aria-label="翻译结果" hidden>
+            <h2>翻译结果</h2>
+            <textarea id="screenshot-translation-text" class="screenshot-translation-text" aria-label="翻译结果" readonly></textarea>
           </section>
         </div>
 
         <div id="screenshot-toolbar" class="screenshot-toolbar" aria-label="截图工具栏">
-          <button class="screenshot-tool-button" type="button" disabled>Rect</button>
-          <button class="screenshot-tool-button" type="button" disabled>Arrow</button>
-          <button class="screenshot-tool-button" type="button" disabled>Text</button>
-          <button class="screenshot-tool-button" type="button" disabled>Save</button>
+          <button id="screenshot-more" class="screenshot-tool-button" type="button" disabled>more</button>
+          <button id="screenshot-translate" class="screenshot-tool-button" type="button" disabled>翻译</button>
+          <button id="screenshot-copy" class="screenshot-tool-button" type="button" disabled>复制</button>
+          <button id="screenshot-save" class="screenshot-tool-button" type="button" disabled>保存</button>
         </div>
       </section>
     </main>

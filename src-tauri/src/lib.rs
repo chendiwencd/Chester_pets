@@ -73,6 +73,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::add_text_history_item,
             commands::clear_clipboard_history,
+            commands::copy_text_to_clipboard,
             commands::close_screenshot_selector,
             commands::close_screenshot_result,
             commands::complete_screenshot_selection,
@@ -94,6 +95,7 @@ pub fn run() {
             commands::read_image_data_url,
             commands::recall_pet,
             commands::resize_input_panel,
+            commands::save_screenshot_note,
             commands::set_autostart,
             commands::show_file_info,
             commands::set_shortcut,

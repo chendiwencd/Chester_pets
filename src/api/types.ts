@@ -100,3 +100,21 @@ export interface InfoRequest {
 }
 
 export type InfoResponse = string;
+
+export interface TranslationRequest {
+  text: string;
+  target_language?: string;
+  source_language?: string;
+  mode?: "ai" | "basic";
+  context?: string | null;
+}
+
+export interface TranslationResponse {
+  mode: "ai" | "basic";
+  provider: "openai" | "microsoft";
+  source_language: string;
+  target_language: string;
+  translated_text: string;
+  model?: string | null;
+  note?: string | null;
+}

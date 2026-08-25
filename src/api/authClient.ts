@@ -12,6 +12,8 @@ import type {
   InfoResponse,
   OCRRequest,
   OCRResponse,
+  TranslationRequest,
+  TranslationResponse,
 } from "./types";
 
 export class ApiClient {
@@ -108,6 +110,13 @@ export class ApiClient {
 
   async commandInfo(data: InfoRequest): Promise<InfoResponse> {
     return this.request<InfoResponse>("/api/v1/tools/command/info", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async translateText(data: TranslationRequest): Promise<TranslationResponse> {
+    return this.request<TranslationResponse>("/api/v1/tools/translate", {
       method: "POST",
       body: JSON.stringify(data),
     });
