@@ -24,7 +24,7 @@
 - `refreshToken()`: 刷新 token
 - `logout()`: 登出
 
-默认后端地址：`http://127.0.0.1:8000`
+默认后端地址：`http://127.0.0.1:5000`
 
 ### 3. `src/authStore.ts`
 全局认证状态管理：
@@ -89,8 +89,8 @@ npm run dev
 ### 接口文档
 
 可访问后端 API 文档：
-- Swagger UI: http://127.0.0.1:8000/docs
-- ReDoc: http://127.0.0.1:8000/redoc
+- Swagger UI: http://127.0.0.1:5000/docs
+- ReDoc: http://127.0.0.1:5000/redoc
 
 ### 数据持久化
 

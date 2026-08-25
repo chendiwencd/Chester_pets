@@ -261,7 +261,7 @@
     window.testBackendConnection = async () => {
       log('test-output', '测试后端连接...', 'info');
       try {
-        const response = await fetch('http://127.0.0.1:8000/api/v1/health');
+        const response = await fetch('http://127.0.0.1:5000/api/v1/health');
         if (response.ok) {
           const data = await response.json();
           log('test-output', `后端连接成功: ${JSON.stringify(data)}`, 'success');
@@ -269,7 +269,7 @@
           log('test-output', `后端响应错误: ${response.status}`, 'error');
         }
       } catch (err) {
-        log('test-output', `后端连接失败: ${err.message}\n请确保后端已启动: http://127.0.0.1:8000`, 'error');
+        log('test-output', `后端连接失败: ${err.message}\n请确保后端已启动: http://127.0.0.1:5000`, 'error');
       }
     };
 

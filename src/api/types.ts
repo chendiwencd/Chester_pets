@@ -77,3 +77,26 @@ export interface ApiError {
   detail: string;
   code?: string;
 }
+
+export interface OCRRequest {
+  image_data_url: string;
+  language?: string;
+  context?: string;
+}
+
+export interface OCRInfo {
+  subject: string;
+  summary: string;
+  key_points: string[];
+  terms: string[];
+}
+
+export type OCRResponse = string;
+
+export interface InfoRequest {
+  text: string;
+  language?: string;
+  context?: string | null;
+}
+
+export type InfoResponse = string;

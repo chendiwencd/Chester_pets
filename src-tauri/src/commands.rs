@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::image::Image;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 
 use crate::state::{
     images_dir, save_history, save_position, AppState, ClipboardHistoryItem, PetPosition,
@@ -140,6 +141,75 @@ pub fn get_monitor_mode(state: State<AppState>) -> bool {
 pub fn set_monitor_mode(app: AppHandle, enabled: bool) -> bool {
     settings::apply_monitor_mode(&app, enabled);
     enabled
+}
+
+#[tauri::command]
+pub fn get_shortcut_settings(state: State<AppState>) -> crate::state::ShortcutSettings {
+    state.shortcuts.lock().unwrap().clone()
+}
+
+#[tauri::command]
+pub fn set_shortcut(
+    app: AppHandle,
+    state: State<AppState>,
+    action: String,
+    shortcut: String,
+) -> Result<crate::state::ShortcutSettings, String> {
+    let parsed = shortcut
+        .trim()
+        .parse::<Shortcut>()
+        .map_err(|err| format!("快捷键格式无效：{err}"))?;
+    if parsed.mods.is_empty() {
+        return Err("快捷键至少需要包含一个修饰键。".to_string());
+    }
+    let normalized = parsed.to_string();
+
+    let mut current = state.shortcuts.lock().unwrap().clone();
+    let (old_value, other_value) = match action.as_str() {
+        "storage" => (current.storage.clone(), current.screenshot.clone()),
+        "screenshot" => (current.screenshot.clone(), current.storage.clone()),
+        _ => return Err("未知的快捷键动作。".to_string()),
+    };
+    if normalized == other_value {
+        return Err("该快捷键已被其他功能占用。".to_string());
+    }
+    if normalized == old_value {
+        return Ok(current);
+    }
+
+    let shortcuts = app.global_shortcut();
+    if shortcuts.is_registered(old_value.as_str()) {
+        shortcuts
+            .unregister(old_value.as_str())
+            .map_err(|err| format!("无法释放旧快捷键：{err}"))?;
+    }
+    if let Err(err) = shortcuts.register(normalized.as_str()) {
+        let _ = shortcuts.register(old_value.as_str());
+        return Err(format!("无法注册快捷键：{err}"));
+    }
+
+    if action == "storage" {
+        current.storage = normalized;
+    } else {
+        current.screenshot = normalized;
+    }
+    let mut settings = crate::state::load_settings(&app);
+    settings.shortcuts = current.clone();
+    if let Err(err) = crate::state::save_settings(&app, &settings) {
+        let _ = shortcuts.unregister(current_value(&current, &action));
+        let _ = shortcuts.register(old_value.as_str());
+        return Err(format!("快捷键保存失败：{err}"));
+    }
+    *state.shortcuts.lock().unwrap() = current.clone();
+    Ok(current)
+}
+
+fn current_value<'a>(settings: &'a crate::state::ShortcutSettings, action: &str) -> &'a str {
+    if action == "storage" {
+        &settings.storage
+    } else {
+        &settings.screenshot
+    }
 }
 
 #[tauri::command]
@@ -547,14 +617,10 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> bool {
 
     // 以系统实际状态为准回写 settings.json，避免设置文件和注册表状态不一致。
     let actual = manager.is_enabled().unwrap_or(false);
-    let monitor_mode = *app.state::<AppState>().monitor_mode.lock().unwrap();
-    let _ = crate::state::save_settings(
-        &app,
-        &crate::state::AppSettings {
-            monitor_mode,
-            autostart: actual,
-        },
-    );
+    let mut settings = crate::state::load_settings(&app);
+    settings.monitor_mode = *app.state::<AppState>().monitor_mode.lock().unwrap();
+    settings.autostart = actual;
+    let _ = crate::state::save_settings(&app, &settings);
     actual
 }
 
@@ -717,6 +783,13 @@ pub fn close_screenshot_selector(app: AppHandle) {
 }
 
 #[tauri::command]
+pub fn close_screenshot_result(app: AppHandle) {
+    if let Some(window) = app.get_webview_window("screenshot-result") {
+        let _ = window.hide();
+    }
+}
+
+#[tauri::command]
 pub fn complete_screenshot_selection(app: AppHandle, rect: ScreenshotSelectionRect) {
     if let Some(window) = app.get_webview_window("screenshot-selector") {
         let _ = window.hide();
@@ -725,7 +798,6 @@ pub fn complete_screenshot_selection(app: AppHandle, rect: ScreenshotSelectionRe
         return;
     }
     let image_data_url = capture_screenshot_data_url(&rect).unwrap_or_default();
-
     let window = match app.get_webview_window("screenshot-result") {
         Some(existing) => existing,
         None => match windows::build_screenshot_result_window(&app) {
@@ -764,12 +836,7 @@ pub fn show_file_info(app: AppHandle, payload: FileInfoPayload) {
 
 // 供 lib.rs 在“应用整体失焦”时调用：一把梭隐藏所有面板/预览窗口
 pub fn hide_all_overlays(app: &AppHandle) {
-    for label in [
-        "panel-web",
-        "preview",
-        "screenshot-selector",
-        "screenshot-result",
-    ] {
+    for label in ["panel-web", "preview", "screenshot-selector"] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.hide();
         }

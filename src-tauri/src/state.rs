@@ -6,6 +6,8 @@ use tauri::{AppHandle, Manager};
 
 pub const DEFAULT_X: i32 = 800;
 pub const DEFAULT_Y: i32 = 500;
+pub const DEFAULT_STORAGE_SHORTCUT: &str = "CmdOrCtrl+Shift+V";
+pub const DEFAULT_SCREENSHOT_SHORTCUT: &str = "Alt+D";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct PetPosition {
@@ -26,11 +28,37 @@ impl Default for PetPosition {
 pub struct AppState {
     pub panel_open: Mutex<bool>,
     pub monitor_mode: Mutex<bool>,
+    pub shortcuts: Mutex<ShortcutSettings>,
     pub clipboard_signatures: Mutex<ClipboardSignatures>,
     pub clipboard_history: Mutex<Vec<ClipboardHistoryItem>>,
     pub clipboard_history_seq: Mutex<u64>,
     pub focused_windows: Mutex<HashSet<String>>,
     pub focus_epoch: Mutex<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShortcutSettings {
+    #[serde(default = "default_storage_shortcut")]
+    pub storage: String,
+    #[serde(default = "default_screenshot_shortcut")]
+    pub screenshot: String,
+}
+
+fn default_storage_shortcut() -> String {
+    DEFAULT_STORAGE_SHORTCUT.to_string()
+}
+
+fn default_screenshot_shortcut() -> String {
+    DEFAULT_SCREENSHOT_SHORTCUT.to_string()
+}
+
+impl Default for ShortcutSettings {
+    fn default() -> Self {
+        Self {
+            storage: default_storage_shortcut(),
+            screenshot: default_screenshot_shortcut(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -57,6 +85,8 @@ pub struct AppSettings {
     // 开机自启，默认关。#[serde(default)] 保证旧版 settings.json（没有该字段）也能正常加载。
     #[serde(default)]
     pub autostart: bool,
+    #[serde(default)]
+    pub shortcuts: ShortcutSettings,
 }
 
 impl Default for AppSettings {
@@ -64,6 +94,7 @@ impl Default for AppSettings {
         Self {
             monitor_mode: false,
             autostart: false,
+            shortcuts: ShortcutSettings::default(),
         }
     }
 }

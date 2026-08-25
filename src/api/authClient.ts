@@ -8,12 +8,16 @@ import type {
   SendCodeResponse,
   SimpleMessageResponse,
   ApiError,
+  InfoRequest,
+  InfoResponse,
+  OCRRequest,
+  OCRResponse,
 } from "./types";
 
 export class ApiClient {
   private baseURL: string;
 
-  constructor(baseURL: string = "http://127.0.0.1:8000") {
+  constructor(baseURL: string = "http://127.0.0.1:5000") {
     this.baseURL = baseURL;
   }
 
@@ -92,6 +96,20 @@ export class ApiClient {
   async logout(): Promise<SimpleMessageResponse> {
     return this.request<SimpleMessageResponse>("/api/v1/auth/logout", {
       method: "POST",
+    });
+  }
+
+  async ocrImage(data: OCRRequest): Promise<OCRResponse> {
+    return this.request<OCRResponse>("/api/v1/tools/ocr", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async commandInfo(data: InfoRequest): Promise<InfoResponse> {
+    return this.request<InfoResponse>("/api/v1/tools/command/info", {
+      method: "POST",
+      body: JSON.stringify(data),
     });
   }
 }

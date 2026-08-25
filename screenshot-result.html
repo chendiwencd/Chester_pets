@@ -4,16 +4,28 @@
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>截图 OCR</title>
+    <title>截图识别</title>
     <script type="module" src="/src/screenshotResultMain.ts" defer></script>
   </head>
   <body>
     <main id="screenshot-result-root" class="screenshot-result-root">
+      <header id="screenshot-result-titlebar" class="screenshot-result-titlebar">
+        <span>截图识别</span>
+        <button id="screenshot-result-close" class="screenshot-result-close" type="button" aria-label="关闭">×</button>
+      </header>
       <section class="screenshot-image-panel">
         <img id="screenshot-image" class="screenshot-image" alt="" />
       </section>
       <section class="screenshot-side-panel">
-        <textarea id="screenshot-ocr-text" class="screenshot-ocr-text" aria-label="OCR 结果"></textarea>
+        <div class="screenshot-result-content">
+          <div id="screenshot-ocr-status" class="screenshot-ocr-status" role="status">等待截图</div>
+          <textarea id="screenshot-ocr-text" class="screenshot-ocr-text" aria-label="OCR 结果"></textarea>
+          <section class="screenshot-knowledge-panel" aria-label="相关科普">
+            <h2>更多信息</h2>
+            <div id="screenshot-knowledge" class="screenshot-knowledge"></div>
+          </section>
+        </div>
+
         <div id="screenshot-toolbar" class="screenshot-toolbar" aria-label="截图工具栏">
           <button class="screenshot-tool-button" type="button" disabled>Rect</button>
           <button class="screenshot-tool-button" type="button" disabled>Arrow</button>

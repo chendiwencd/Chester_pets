@@ -7,10 +7,15 @@ mod windows;
 
 use std::time::Duration;
 use tauri::{DragDropEvent, Emitter, Manager, WindowEvent};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
-const STORAGE_SHORTCUT: &str = "CmdOrCtrl+Shift+V";
-const SCREENSHOT_SHORTCUT: &str = "Alt+D";
+fn normalize_shortcut(value: &str, fallback: &str) -> String {
+    value
+        .parse::<Shortcut>()
+        .or_else(|_| fallback.parse::<Shortcut>())
+        .map(|shortcut| shortcut.to_string())
+        .unwrap_or_else(|_| fallback.to_string())
+}
 
 #[derive(Clone, serde::Serialize)]
 struct FileDragStatePayload {
@@ -36,21 +41,28 @@ pub fn run() {
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
-                    // 只注册了 Ctrl+Shift+V 一个全局快捷键，按下(而非松开)时打开存储区。
-                    if event.state() == ShortcutState::Pressed
-                        && shortcut.matches(
-                            tauri_plugin_global_shortcut::Modifiers::CONTROL
-                                | tauri_plugin_global_shortcut::Modifiers::SHIFT,
-                            tauri_plugin_global_shortcut::Code::KeyV,
-                        )
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+
+                    let configured = app
+                        .state::<state::AppState>()
+                        .shortcuts
+                        .lock()
+                        .unwrap()
+                        .clone();
+                    if configured
+                        .storage
+                        .parse::<Shortcut>()
+                        .map(|expected| shortcut == &expected)
+                        .unwrap_or(false)
                     {
                         commands::open_storage_impl(app);
-                    }
-                    if event.state() == ShortcutState::Pressed
-                        && shortcut.matches(
-                            tauri_plugin_global_shortcut::Modifiers::ALT,
-                            tauri_plugin_global_shortcut::Code::KeyD,
-                        )
+                    } else if configured
+                        .screenshot
+                        .parse::<Shortcut>()
+                        .map(|expected| shortcut == &expected)
+                        .unwrap_or(false)
                     {
                         commands::open_screenshot_selector(app.clone());
                     }
@@ -62,11 +74,13 @@ pub fn run() {
             commands::add_text_history_item,
             commands::clear_clipboard_history,
             commands::close_screenshot_selector,
+            commands::close_screenshot_result,
             commands::complete_screenshot_selection,
             commands::copy_clipboard_history_item,
             commands::delete_clipboard_history_item,
             commands::get_autostart,
             commands::get_monitor_mode,
+            commands::get_shortcut_settings,
             commands::log_debug,
             commands::get_clipboard_history,
             commands::open_control_panel,
@@ -82,6 +96,7 @@ pub fn run() {
             commands::resize_input_panel,
             commands::set_autostart,
             commands::show_file_info,
+            commands::set_shortcut,
             commands::toggle_pin_clipboard_history_item,
             commands::save_pet_position,
             commands::set_panel_visibility,
@@ -91,7 +106,24 @@ pub fn run() {
             let handle = app.handle();
             let position = state::load_position(handle);
             let history = state::load_history(handle);
-            let settings = state::load_settings(handle);
+            let mut settings = state::load_settings(handle);
+            settings.shortcuts.storage = normalize_shortcut(
+                &settings.shortcuts.storage,
+                state::DEFAULT_STORAGE_SHORTCUT,
+            );
+            settings.shortcuts.screenshot = normalize_shortcut(
+                &settings.shortcuts.screenshot,
+                state::DEFAULT_SCREENSHOT_SHORTCUT,
+            );
+            if settings.shortcuts.storage == settings.shortcuts.screenshot {
+                settings.shortcuts.storage =
+                    normalize_shortcut("", state::DEFAULT_STORAGE_SHORTCUT);
+                if settings.shortcuts.storage == settings.shortcuts.screenshot {
+                    settings.shortcuts.screenshot =
+                        normalize_shortcut("", state::DEFAULT_SCREENSHOT_SHORTCUT);
+                }
+            }
+            let _ = state::save_settings(handle, &settings);
             println!(
                 "[setup] loaded pet position ({}, {})",
                 position.x, position.y
@@ -107,6 +139,7 @@ pub fn run() {
                 *app_state.clipboard_history_seq.lock().unwrap() =
                     history.iter().map(|item| item.id).max().unwrap_or(0);
                 *app_state.monitor_mode.lock().unwrap() = settings.monitor_mode;
+                *app_state.shortcuts.lock().unwrap() = settings.shortcuts.clone();
             }
 
             // 让系统自启注册状态与 settings.json 里的 autostart 一致（默认 false）。
@@ -122,17 +155,35 @@ pub fn run() {
                 println!("[setup] autostart target={}", settings.autostart);
             }
 
-            // 注册全局快捷键 Ctrl+Shift+V 打开存储区（常驻，整个应用生命周期都在）。
-            match handle.global_shortcut().register(STORAGE_SHORTCUT) {
-                Ok(_) => println!("[setup] registered global shortcut {STORAGE_SHORTCUT}"),
+            // 注册设置中保存的全局快捷键（常驻，整个应用生命周期都在）。
+            match handle
+                .global_shortcut()
+                .register(settings.shortcuts.storage.as_str())
+            {
+                Ok(_) => println!(
+                    "[setup] registered storage shortcut {}",
+                    settings.shortcuts.storage
+                ),
                 Err(err) => {
-                    eprintln!("[setup] failed to register {STORAGE_SHORTCUT}: {err}")
+                    eprintln!(
+                        "[setup] failed to register storage shortcut {}: {err}",
+                        settings.shortcuts.storage
+                    )
                 }
             }
-            match handle.global_shortcut().register(SCREENSHOT_SHORTCUT) {
-                Ok(_) => println!("[setup] registered global shortcut {SCREENSHOT_SHORTCUT}"),
+            match handle
+                .global_shortcut()
+                .register(settings.shortcuts.screenshot.as_str())
+            {
+                Ok(_) => println!(
+                    "[setup] registered screenshot shortcut {}",
+                    settings.shortcuts.screenshot
+                ),
                 Err(err) => {
-                    eprintln!("[setup] failed to register {SCREENSHOT_SHORTCUT}: {err}")
+                    eprintln!(
+                        "[setup] failed to register screenshot shortcut {}: {err}",
+                        settings.shortcuts.screenshot
+                    )
                 }
             }
 
@@ -243,7 +294,7 @@ pub fn run() {
                 }
             }
 
-            // 宠物窗口和 3 个面板窗口都只是"隐藏"，不真的销毁：
+            // 宠物窗口和常驻面板窗口都只是"隐藏"，不真的销毁：
             // - 面板隐藏后内容还在，下次打开面板不用重新粘贴
             // - 宠物窗口隐藏后靠托盘菜单"显示/隐藏宠物"找回，只有托盘"退出"才真正结束进程
             if let WindowEvent::CloseRequested { api, .. } = event {

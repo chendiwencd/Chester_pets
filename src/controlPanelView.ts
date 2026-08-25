@@ -2,8 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { authStore } from "./authStore";
 
-type SectionKey = "personal" | "pet" | "settings";
+type SectionKey = "personal" | "pet" | "settings" | "shortcuts";
 type AuthMode = "login" | "register";
+type ShortcutAction = "storage" | "screenshot";
+
+interface ShortcutSettings {
+  storage: string;
+  screenshot: string;
+}
 
 // 开关行：左侧标题+说明，右侧一个可点击的开关。initial 决定初始状态，
 // onChange 返回“落地后的真实状态”（命令可能失败），据此回写 UI，避免 UI 和系统实际状态不一致。
@@ -85,6 +91,161 @@ function createPlaceholderRow(title: string, description: string, extra?: string
   badge.textContent = extra ?? "保留";
 
   row.append(textWrap, badge);
+  return row;
+}
+
+function formatShortcut(value: string): string {
+  const labels: Record<string, string> = {
+    control: "Ctrl",
+    ctrl: "Ctrl",
+    cmdorctrl: "Ctrl",
+    super: "Win",
+    command: "Cmd",
+    cmd: "Cmd",
+    shift: "Shift",
+    alt: "Alt",
+    option: "Alt",
+    space: "Space",
+    escape: "Esc",
+    enter: "Enter",
+    backspace: "Backspace",
+    delete: "Delete",
+    arrowup: "Up",
+    arrowdown: "Down",
+    arrowleft: "Left",
+    arrowright: "Right",
+  };
+  return value
+    .split("+")
+    .map((part) => {
+      const trimmed = part.trim();
+      const lower = trimmed.toLowerCase();
+      if (labels[lower]) return labels[lower];
+      if (/^key[a-z]$/i.test(trimmed)) return trimmed.slice(3).toUpperCase();
+      if (/^digit\d$/i.test(trimmed)) return trimmed.slice(5);
+      if (/^f\d{1,2}$/i.test(trimmed)) return trimmed.toUpperCase();
+      return trimmed;
+    })
+    .join(" + ");
+}
+
+function shortcutFromKeyboardEvent(event: KeyboardEvent): string | null {
+  if (["Control", "Shift", "Alt", "Meta"].includes(event.key)) {
+    return null;
+  }
+  if (!(event.ctrlKey || event.metaKey || event.altKey || event.shiftKey)) {
+    return null;
+  }
+
+  const modifiers: string[] = [];
+  if (event.ctrlKey || event.metaKey) modifiers.push("CmdOrCtrl");
+  if (event.shiftKey) modifiers.push("Shift");
+  if (event.altKey) modifiers.push("Alt");
+
+  const key = event.code || event.key;
+  if (!key || ["Unidentified", "ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight"].includes(key)) {
+    return null;
+  }
+  return [...modifiers, key].join("+");
+}
+
+function createShortcutRow(
+  action: ShortcutAction,
+  title: string,
+  description: string,
+  initial: string,
+  onSave: (shortcut: string) => Promise<ShortcutSettings>,
+): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "control-panel-shortcut-row";
+
+  const copy = document.createElement("div");
+  copy.className = "control-panel-setting-copy";
+  const heading = document.createElement("div");
+  heading.className = "control-panel-setting-title";
+  heading.textContent = title;
+  const desc = document.createElement("div");
+  desc.className = "control-panel-setting-desc";
+  desc.textContent = description;
+  copy.append(heading, desc);
+
+  const controls = document.createElement("div");
+  controls.className = "control-panel-shortcut-controls";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "control-panel-shortcut-input";
+  input.readOnly = true;
+  input.value = formatShortcut(initial);
+  input.setAttribute("aria-label", `${title}快捷键`);
+
+  const saveButton = document.createElement("button");
+  saveButton.type = "button";
+  saveButton.className = "control-panel-secondary-button";
+  saveButton.textContent = "保存";
+  saveButton.disabled = true;
+
+  const resetButton = document.createElement("button");
+  resetButton.type = "button";
+  resetButton.className = "control-panel-link-button control-panel-shortcut-reset";
+  resetButton.textContent = "恢复默认";
+
+  const status = document.createElement("span");
+  status.className = "control-panel-shortcut-status";
+  status.setAttribute("role", "status");
+
+  let current = initial;
+  let pending = initial;
+  const sync = () => {
+    input.value = formatShortcut(pending);
+    saveButton.disabled = pending === current;
+  };
+
+  input.addEventListener("keydown", (event) => {
+    const next = shortcutFromKeyboardEvent(event);
+    if (!next) {
+      event.preventDefault();
+      status.textContent = "请按下包含 Ctrl、Alt 或 Shift 的组合键";
+      return;
+    }
+    event.preventDefault();
+    pending = next;
+    status.textContent = "";
+    sync();
+  });
+  input.addEventListener("focus", () => {
+    status.textContent = "请直接按下新的组合键";
+  });
+
+  saveButton.addEventListener("click", async () => {
+    saveButton.disabled = true;
+    resetButton.disabled = true;
+    status.textContent = "保存中...";
+    try {
+      const updated = await onSave(pending);
+      current = updated[action];
+      pending = current;
+      status.textContent = "已生效";
+      sync();
+    } catch (err) {
+      status.textContent = err instanceof Error ? err.message : String(err);
+      sync();
+    } finally {
+      resetButton.disabled = false;
+    }
+  });
+
+  resetButton.addEventListener("click", async () => {
+    const defaultShortcut = action === "storage" ? "CmdOrCtrl+Shift+V" : "Alt+D";
+    pending = defaultShortcut;
+    sync();
+    if (pending !== current) {
+      saveButton.click();
+    }
+  });
+
+  controls.append(input, saveButton, resetButton, status);
+  row.append(copy, controls);
   return row;
 }
 
@@ -314,9 +475,9 @@ function renderPetSection(content: HTMLElement): void {
   const card = document.createElement("section");
   card.className = "control-panel-card";
   card.innerHTML = `
-    <h2 class="control-panel-card-title">保留位置</h2>
+    <h2 class="control-panel-card-title">宠物状态</h2>
     <p class="control-panel-muted">
-      这里预留给宠物档案、状态说明、成长信息等内容，当前仅保留结构。
+      TODO
     </p>
   `;
 
@@ -368,6 +529,59 @@ async function renderSettingsSection(content: HTMLElement): Promise<void> {
     createPlaceholderRow("记忆导出", "导出生成的记忆内容。"),
     createPlaceholderRow("形成记忆", "整理与生成结构化记忆。"),
     createPlaceholderRow("导入记忆", "用于导入外部记忆数据。"),
+  );
+
+  content.append(title, card);
+}
+
+async function renderShortcutsSection(content: HTMLElement): Promise<void> {
+  content.innerHTML = "";
+
+  const title = document.createElement("h1");
+  title.className = "control-panel-title";
+  title.textContent = "快捷键";
+
+  const card = document.createElement("section");
+  card.className = "control-panel-card control-panel-settings-card";
+
+  const cardTitle = document.createElement("h2");
+  cardTitle.className = "control-panel-card-title";
+  cardTitle.textContent = "热键设置";
+  card.append(cardTitle);
+
+  let settings: ShortcutSettings;
+  try {
+    settings = await invoke<ShortcutSettings>("get_shortcut_settings");
+  } catch (err) {
+    const error = document.createElement("p");
+    error.className = "control-panel-muted";
+    error.textContent = `读取快捷键失败：${err instanceof Error ? err.message : String(err)}`;
+    card.append(error);
+    content.append(title, card);
+    return;
+  }
+
+  const save = (action: ShortcutAction) => (shortcut: string) =>
+    invoke<ShortcutSettings>("set_shortcut", { action, shortcut }).then((updated) => {
+      settings = updated;
+      return updated;
+    });
+
+  card.append(
+    createShortcutRow(
+      "storage",
+      "打开存储区",
+      "使用全局快捷键打开剪贴板存储区。",
+      settings.storage,
+      save("storage"),
+    ),
+    createShortcutRow(
+      "screenshot",
+      "截图选择器",
+      "使用全局快捷键打开截图区域选择器。",
+      settings.screenshot,
+      save("screenshot"),
+    ),
   );
 
   content.append(title, card);
@@ -426,6 +640,10 @@ export async function initControlPanelView(root: HTMLElement): Promise<void> {
         activeSection = "settings";
         render();
       }),
+      createNavButton("快捷键", activeSection === "shortcuts", () => {
+        activeSection = "shortcuts";
+        render();
+      }),
     );
 
     sidebar.append(navTop, navBottom);
@@ -437,8 +655,10 @@ export async function initControlPanelView(root: HTMLElement): Promise<void> {
       renderPersonalSection(content);
     } else if (activeSection === "pet") {
       renderPetSection(content);
-    } else {
+    } else if (activeSection === "settings") {
       void renderSettingsSection(content);
+    } else {
+      void renderShortcutsSection(content);
     }
 
     layout.append(sidebar, content);

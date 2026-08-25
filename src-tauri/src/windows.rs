@@ -283,11 +283,7 @@ pub fn build_screenshot_result_window(app: &AppHandle) -> tauri::Result<WebviewW
     println!(
         "[windows] build screenshot-result size=({SCREENSHOT_RESULT_WIDTH}, {SCREENSHOT_RESULT_HEIGHT}) visible=false"
     );
-    WebviewWindowBuilder::new(
-        app,
-        "screenshot-result",
-        WebviewUrl::App("screenshot-result.html".into()),
-    )
+    WebviewWindowBuilder::new(app, "screenshot-result", WebviewUrl::App("screenshot-result.html".into()))
     .title("截图 OCR")
     .inner_size(SCREENSHOT_RESULT_WIDTH, SCREENSHOT_RESULT_HEIGHT)
     .decorations(false)
