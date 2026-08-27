@@ -15,8 +15,8 @@
 - 点击宠物是三段循环：**等待 → 打开（三个面板） → 存储区（剪贴板历史） → 等待**。
 
 **剪贴板 / 存储**
-- 托盘「监控模式」开启后，后台每 450ms 同步一次系统剪贴板最新内容到历史。
-- 存储：图片写成 `.png` 文件放 `app_data_dir/images/`（历史 JSON 只存路径，避免膨胀）；文本/记事本内联存在历史 JSON 里。
+- 托盘「监控模式」开启后，后台每 450ms 同步一次系统剪贴板最新内容到历史；关闭后停止持续收集，但不影响素材区查看已有历史。
+- 存储：图片写成 `.png` 文件放 `app_data_dir/images/`；放入的文件和记事本附件复制到工作目录；SQLite 保存历史记录、记事本正文，以及图片/文件的路径、名称、大小、类型等元数据。
 - 三个内容面板（图片 / 文本 / 网页输入）用木牌背景（`board.png`）贴在宠物旁边；第三个面板带输入框，手动输入的内容作为「记事本」类别存入历史。
 - 存储区（preview 窗口）按三类区分：**文本**（剪贴板文本/链接）、**图片**、**记事本**（第三面板手动输入）；支持分类筛选、置顶、删除、复制回剪贴板、点图看原图。
 - 历史上限 100 条，超出时删最旧的**未置顶**项（置顶内容不会被挤掉）。
@@ -47,7 +47,7 @@
 src-tauri/src/
   lib.rs         入口：注册插件(单实例/剪贴板/自启/全局快捷键)、托盘、启动还原、全局失焦/关闭规则、注册全局快捷键
   commands.rs     前端可调命令 + open_storage/recall_pet 等实现
-  clipboard.rs    监控线程 + 剪贴板分流；图片写 .png、文本写 .txt，历史只存路径
+  clipboard.rs    监控线程 + 剪贴板分流；图片写 .png，历史和资源元数据写 SQLite
   windows.rs      各窗口构造；跨屏定位(全物理坐标)、显示器钳制、面板边界翻转布局
   state.rs        持久化(位置/历史/设置)、images_dir/texts_dir、AppState
   settings.rs     监控模式的读写 + 托盘刷新
@@ -76,4 +76,4 @@ tests/              holdStateMachine 单测(vitest)
 
 ## 运行时数据位置（Windows）
 
-`%APPDATA%/com.hbb.desktop-pet/`：`pet_position.json`、`clipboard_history.json`、`settings.json`、`images/*.png`。
+`%APPDATA%/com.hbb.desktop-pet/`：`pet_position.json`、`settings.json`、`content.sqlite3`、`images/*.png`。默认工作目录为当前用户主目录下的 `user/chesterbot/workspace/`，可在设置中修改。

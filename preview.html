@@ -4,39 +4,10 @@
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>预览</title>
+    <title>工作区</title>
     <script type="module" src="/src/previewMain.ts" defer></script>
   </head>
   <body>
-    <main id="preview-root" class="preview-root">
-      <div class="preview-window-shell">
-        <button id="preview-close" class="preview-close" type="button" aria-label="关闭预览">
-          ×
-        </button>
-        <div class="preview-layout">
-          <aside class="preview-sidebar">
-            <div class="preview-sidebar-shell">
-              <div class="preview-toolbar">
-                <div id="preview-filters" class="preview-filters"></div>
-                <button id="preview-clear" class="preview-clear" type="button" aria-label="删除模式">
-                  <span class="preview-clear-icon" aria-hidden="true"></span>
-                </button>
-              </div>
-              <aside id="preview-history" class="preview-history"></aside>
-            </div>
-          </aside>
-          <section class="preview-main">
-            <div class="preview-main-shell">
-              <section id="preview-content" class="preview-content"></section>
-              <div class="preview-actions">
-                <button id="preview-pin" class="preview-main-action" type="button">置顶</button>
-                <button id="preview-copy" class="preview-main-action" type="button">复制</button>
-                <button id="preview-delete" class="preview-main-action" type="button">删除</button>
-              </div>
-            </div>
-          </section>
-        </div>
-      </div>
-    </main>
+    <main id="workspace-root" class="workspace-root preview-workspace"></main>
   </body>
 </html>

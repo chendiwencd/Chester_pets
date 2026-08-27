@@ -10,8 +10,8 @@ pub const PET_SIZE: f64 = 120.0;
 // 窗口比例
 pub const PANEL_WIDTH: f64 = 360.0;
 pub const PANEL_HEIGHT: f64 = 220.0;
-pub const PREVIEW_WIDTH: f64 = 800.0;
-pub const PREVIEW_HEIGHT: f64 = 450.0;
+pub const PREVIEW_WIDTH: f64 = 960.0;
+pub const PREVIEW_HEIGHT: f64 = 620.0;
 pub const IMAGE_VIEWER_WIDTH: f64 = 1000.0;
 pub const IMAGE_VIEWER_HEIGHT: f64 = 700.0;
 pub const CONTROL_PANEL_WIDTH: f64 = 980.0;
@@ -194,6 +194,7 @@ pub fn build_preview_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     );
     let window = WebviewWindowBuilder::new(app, "preview", WebviewUrl::App("preview.html".into()))
         .inner_size(PREVIEW_WIDTH, PREVIEW_HEIGHT)
+        .min_inner_size(760.0, 520.0)
         .decorations(false)
         .always_on_top(true)
         .resizable(true)

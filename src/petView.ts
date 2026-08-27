@@ -5,6 +5,13 @@ import { HOVER_INTENT_MS, HoldStateMachine, LONG_PRESS_MS } from "./holdStateMac
 import { PetStatusStore, type MovingDirection, type PetStatus } from "./store";
 import { SpriteRenderer } from "./spriteRenderer";
 import { backendClient } from "./backendClient";
+import {
+  clipboardFileFromEvent,
+  importClipboardPayload,
+  importFile,
+  importPath,
+} from "./materialImport";
+import type { MaterialPayload } from "./materialImport";
 
 const SAVE_POSITION_DEBOUNCE_MS = 300;
 const DRAGGABLE_DATA_TYPES = [
@@ -38,7 +45,6 @@ export function initPetView(root: HTMLElement): void {
   const store = new PetStatusStore();
   const renderer = new SpriteRenderer(root);
 
-  const CLIPBOARD_POLL_MS = 450;
   const AUTO_MOVE_SPEED_PX_PER_SEC = 450;
   const SLEEP_AFTER_MS = 2 * 60 * 1000;
   const LEAVE_GRACE_MS = 600;
@@ -49,10 +55,20 @@ export function initPetView(root: HTMLElement): void {
   const IDLE_WANDER_MIN_DIST = 120;
   const IDLE_WANDER_MAX_DIST = 320;
   const CURSOR_FOLLOW_MS = 16;
+  const EXPLAIN_FILE_TIMEOUT_MS = 15_000;
 
-  type Mode = "waiting" | "open" | "preview" | "moving" | "sleep" | "waitting_file";
+  type Mode =
+    | "waiting"
+    | "open"
+    | "preview"
+    | "moving"
+    | "sleep"
+    | "waitting_file"
+    | "explain_file";
   let mode: Mode = "waiting";
   let fileWaitingBeforeMode: Mode | undefined;
+  let fileDropCandidate = false;
+  let explainFileTimer: number | undefined;
 
   // open 的来源：点击固定打开 或 悬浮意图打开
   let pinnedOpen = false;
@@ -63,7 +79,6 @@ export function initPetView(root: HTMLElement): void {
   let lastStatus = store.get();
 
   let panelVisible = false;
-  let clipboardPollTimer: number | undefined;
   let leaveTimer: number | undefined;
   let suppressHoverUntilLeave = false;
   let inactivityTimer: number | undefined;
@@ -137,19 +152,6 @@ export function initPetView(root: HTMLElement): void {
     backendClient.reportStatus(status);
   });
 
-  const stopClipboardPolling = () => {
-    window.clearInterval(clipboardPollTimer);
-    clipboardPollTimer = undefined;
-  };
-  const startClipboardPolling = () => {
-    if (clipboardPollTimer !== undefined) return;
-    clipboardPollTimer = window.setInterval(() => {
-      invoke("poll_clipboard").catch((err) =>
-        console.error("[petView] poll_clipboard failed", err),
-      );
-    }, CLIPBOARD_POLL_MS);
-  };
-
   const setStatusFromMode = () => {
     const status: PetStatus =
       mode === "waitting_file"
@@ -158,14 +160,14 @@ export function initPetView(root: HTMLElement): void {
         ? "sleep"
         : mode === "moving"
           ? "moving"
-          : mode === "open" || mode === "preview"
+          : mode === "open" || mode === "preview" || mode === "explain_file"
             ? "open"
             : "waiting";
     store.setStatus(status);
   };
 
   const syncPanelVisibility = (reason: string) => {
-    const nextVisible = mode === "open";
+    const nextVisible = mode === "open" || mode === "explain_file";
     if (nextVisible === panelVisible) return;
     logToTauri(
       `[panel visibility] ${reason} mode=${mode} pinnedOpen=${pinnedOpen} hoverOpen=${hoverOpen} previewOpen=${previewOpen} -> visible=${nextVisible}`,
@@ -173,8 +175,6 @@ export function initPetView(root: HTMLElement): void {
     invoke<boolean>("set_panel_visibility", { open: nextVisible })
       .then((visible) => {
         panelVisible = visible;
-        if (visible) startClipboardPolling();
-        else stopClipboardPolling();
       })
       .catch((err) => console.error("[petView] set_panel_visibility failed", err));
   };
@@ -190,6 +190,7 @@ export function initPetView(root: HTMLElement): void {
   const enterFileWaiting = (reason: string) => {
     resetInactivity(reason);
     root.classList.add("is-file-dragging");
+    fileDropCandidate = true;
     if (mode !== "waitting_file") {
       fileWaitingBeforeMode = mode;
     }
@@ -204,6 +205,23 @@ export function initPetView(root: HTMLElement): void {
       : "waiting";
     fileWaitingBeforeMode = undefined;
     setMode(next, reason);
+  };
+
+  const finishFileExplanation = (reason: string) => {
+    window.clearTimeout(explainFileTimer);
+    explainFileTimer = undefined;
+    fileDropCandidate = false;
+    if (mode === "explain_file") {
+      setMode("waiting", reason);
+    }
+  };
+
+  const enterFileExplanation = (reason: string) => {
+    window.clearTimeout(explainFileTimer);
+    setMode("explain_file", reason);
+    explainFileTimer = window.setTimeout(() => {
+      finishFileExplanation("file-explain-timeout");
+    }, EXPLAIN_FILE_TIMEOUT_MS);
   };
 
   const resetInactivity = (reason: string) => {
@@ -437,6 +455,7 @@ export function initPetView(root: HTMLElement): void {
     },
     onClick: () => {
       resetInactivity("click");
+      if (mode === "explain_file") return;
 
       // 点击宠物是一个三段循环：等待 -> 打开(三个面板) -> 存储区(剪贴板历史) -> 等待。
       if (mode === "open") {
@@ -529,19 +548,10 @@ export function initPetView(root: HTMLElement): void {
     );
   };
 
-  const dropTextPayload = (transfer: DataTransfer | null | undefined): string | undefined => {
-    if (!transfer) return undefined;
-    const candidates = [
-      transfer.getData("text/plain"),
-      transfer.getData("text/uri-list"),
-      transfer.getData("text/html"),
-      transfer.getData("text/x-moz-url"),
-    ];
-    return candidates.map((value) => value.trim()).find((value) => value.length > 0);
-  };
-
   const isImageName = (name: string) => /\.(avif|bmp|gif|heic|jpe?g|png|svg|webp)$/i.test(name);
   const isImageFile = (file: File) => file.type.startsWith("image/") || isImageName(file.name);
+  const filePathFromFile = (file: File): string | undefined =>
+    (file as File & { path?: string }).path?.trim() || undefined;
   const imageSourceFromTransfer = (transfer: DataTransfer | null | undefined): string | undefined => {
     if (!transfer) return undefined;
     const uri = transfer.getData("text/uri-list").trim();
@@ -556,33 +566,15 @@ export function initPetView(root: HTMLElement): void {
     return match?.[1]?.trim();
   };
 
-  const dropFilePayload = (file: File, preview?: string) => ({
-    kind: (isImageFile(file) ? "image" : "file") as "image" | "file",
-    name: file.name || "未命名文件",
-    size_bytes: file.size,
-    display_size: formatFileSize(file.size),
-    type_placeholder: (file as File & { path?: string }).path?.trim() || file.name || "未命名文件",
-    preview:
-      preview || (file as File & { path?: string }).path?.trim() || file.name || "未命名文件",
-  });
+  const canImportFiles = () =>
+    mode === "open" ||
+    (mode === "waitting_file" && fileWaitingBeforeMode === "open") ||
+    panelVisible;
 
-  const dropTextResource = (text: string) => ({
-    kind: "text" as const,
-    name: "拖拽文本",
-    size_bytes: text.length,
-    display_size: formatFileSize(text.length),
-    type_placeholder: "文本资源（占位）",
-    preview: text,
-  });
-
-  const dropImageResource = (source: string) => ({
-    kind: "image" as const,
-    name: source.split(/[\\/]/).pop() || "拖拽图片",
-    size_bytes: null,
-    display_size: "",
-    type_placeholder: "图片资源（占位）",
-    preview: source,
-  });
+  const showImportedPayload = (payload: Awaited<ReturnType<typeof importPath>>) => {
+    if (!payload) return;
+    logToTauri(`[material import] ${payload.kind} ${payload.name} overview=${payload.overview ? "yes" : "no"}`);
+  };
 
   root.addEventListener("dragenter", (event) => {
     if (!hasExternalDragData(event)) return;
@@ -606,46 +598,51 @@ export function initPetView(root: HTMLElement): void {
   root.addEventListener("drop", (event) => {
     if (!hasExternalDragData(event)) return;
     event.preventDefault();
+    const allowed = canImportFiles();
     const file = event.dataTransfer?.files[0];
-    if (file) {
-      if (isImageFile(file)) {
-        const reader = new FileReader();
-        reader.addEventListener("load", () => {
-          invoke("show_file_info", {
-            payload: dropFilePayload(
-              file,
-              typeof reader.result === "string" ? reader.result : undefined,
-            ),
-          }).catch((err) => console.error("[petView] show_file_info failed", err));
-        });
-        reader.addEventListener("error", () => {
-          invoke("show_file_info", {
-            payload: dropFilePayload(file),
-          }).catch((err) => console.error("[petView] show_file_info failed", err));
-        });
-        reader.readAsDataURL(file);
-      } else {
-        invoke("show_file_info", {
-          payload: dropFilePayload(file),
-        }).catch((err) => console.error("[petView] show_file_info failed", err));
-      }
-    } else {
-      const imageSource = imageSourceFromTransfer(event.dataTransfer);
-      if (imageSource) {
-        invoke("show_file_info", {
-          payload: dropImageResource(imageSource),
-        }).catch((err) => console.error("[petView] show_file_info failed", err));
-        leaveFileWaiting("file-drop");
+    if (file && allowed) {
+      const path = filePathFromFile(file);
+      if (path) {
+        logToTauri(`[material drop] native path delegated=${path}`);
         return;
       }
-      const text = dropTextPayload(event.dataTransfer);
-      if (text) {
+      logToTauri(
+        `[material drop] kind=${isImageFile(file) ? "image" : "file"} size=${formatFileSize(file.size)}`,
+      );
+      void importFile(file)
+        .then(showImportedPayload)
+        .catch((err) => console.error("[petView] importFile failed", err));
+    } else {
+      const imageSource = imageSourceFromTransfer(event.dataTransfer);
+      if (imageSource && allowed) {
         invoke("show_file_info", {
-          payload: dropTextResource(text),
+          payload: {
+            kind: "image",
+            name: imageSource.split(/[\\/]/).pop() || "拖拽图片",
+            size_bytes: null,
+            mime_type: null,
+            display_size: "",
+            overview: "",
+            type_placeholder: "",
+            preview: imageSource,
+          },
         }).catch((err) => console.error("[petView] show_file_info failed", err));
       }
     }
     leaveFileWaiting("file-drop");
+  });
+
+  void appWindow.listen<string>("file-dropped", (event) => {
+    const allowed = canImportFiles() || fileDropCandidate;
+    logToTauri(
+      `[native file-dropped] allowed=${allowed} mode=${mode} before=${fileWaitingBeforeMode ?? "none"} panelVisible=${panelVisible} candidate=${fileDropCandidate} path=${event.payload}`,
+    );
+    if (!allowed) return;
+    fileDropCandidate = false;
+    enterFileExplanation("native-file-drop");
+    void importPath(event.payload)
+      .then(showImportedPayload)
+      .catch((err) => console.error("[petView] importPath failed", err));
   });
 
   void appWindow.listen<{ active: boolean }>("file-drag-state", (event) => {
@@ -654,20 +651,25 @@ export function initPetView(root: HTMLElement): void {
   });
 
   window.addEventListener(
-    "keydown",
+    "paste",
     (event) => {
-      const isPaste = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "v";
-      if (!isPaste || event.shiftKey || event.altKey || event.repeat || mode !== "open") return;
+      if (mode !== "open") return;
       event.preventDefault();
-      invoke("paste_clipboard_to_input_panel").catch((err) =>
-        console.error("[petView] paste_clipboard_to_input_panel failed", err),
-      );
+      const file = clipboardFileFromEvent(event);
+      if (file) {
+        void importFile(file).catch((err) => console.error("[petView] paste file import failed", err));
+        return;
+      }
+      invoke<MaterialPayload | null>("paste_clipboard_to_input_panel")
+        .then(importClipboardPayload)
+        .catch((err) => console.error("[petView] paste_clipboard_to_input_panel failed", err));
     },
     true,
   );
 
   // 应用整体失焦：关闭一切，回到等待（但不直接进入 sleep，sleep 由计时器控制）
   void appWindow.listen("app-deactivated", () => {
+    if (mode === "explain_file") return;
     pinnedOpen = false;
     hoverOpen = false;
     previewOpen = false;
@@ -676,6 +678,10 @@ export function initPetView(root: HTMLElement): void {
     grabOffset = undefined;
     stopAutoMove();
     setMode("waiting", "app-deactivated");
+  });
+
+  void appWindow.listen("file-explanation-complete", () => {
+    finishFileExplanation("file-explain-complete");
   });
 
   // 预览打开/关闭：保持打开态，但预览态只显示预览窗口
@@ -705,7 +711,6 @@ export function initPetView(root: HTMLElement): void {
     if (status === "sleep") {
       invoke("close_preview").catch(() => {});
       invoke("set_panel_visibility", { open: false }).catch(() => {});
-      stopClipboardPolling();
     }
   });
 }

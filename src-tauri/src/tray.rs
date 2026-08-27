@@ -4,7 +4,7 @@ use tauri::{
     AppHandle, Manager,
 };
 
-use crate::{commands, settings, windows};
+use crate::{commands, settings};
 
 const TRAY_ID: &str = "main-tray";
 
@@ -19,23 +19,10 @@ fn build_tray_menu(app: &AppHandle, monitor_enabled: bool) -> tauri::Result<Menu
         None::<&str>,
     )?;
     let recall_item = MenuItem::with_id(app, "recall_pet", "召回宠物", true, None::<&str>)?;
-    let open_control_panel_item = MenuItem::with_id(
-        app,
-        "open_control_panel",
-        "打开控制面板",
-        true,
-        None::<&str>,
-    )?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     Menu::with_items(
         app,
-        &[
-            &toggle_item,
-            &recall_item,
-            &monitor_item,
-            &open_control_panel_item,
-            &quit_item,
-        ],
+        &[&toggle_item, &recall_item, &monitor_item, &quit_item],
     )
 }
 
@@ -77,9 +64,6 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             }
             "recall_pet" => {
                 commands::recall_pet_impl(app);
-            }
-            "open_control_panel" => {
-                let _ = windows::show_control_panel(app);
             }
             "quit" => app.exit(0),
             _ => {}

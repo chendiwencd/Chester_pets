@@ -94,6 +94,74 @@ function createPlaceholderRow(title: string, description: string, extra?: string
   return row;
 }
 
+function createWorkspaceRow(
+  initial: string,
+  onSave: (directory: string) => Promise<string>,
+): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "control-panel-workspace-row";
+
+  const copy = document.createElement("div");
+  copy.className = "control-panel-setting-copy";
+
+  const heading = document.createElement("div");
+  heading.className = "control-panel-setting-title";
+  heading.textContent = "工作目录";
+
+  const desc = document.createElement("div");
+  desc.className = "control-panel-setting-desc";
+  desc.textContent = "放入的文件和图片附件会复制到这个目录。";
+  copy.append(heading, desc);
+
+  const controls = document.createElement("div");
+  controls.className = "control-panel-workspace-controls";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "control-panel-workspace-input";
+  input.value = initial;
+  input.setAttribute("aria-label", "工作目录");
+
+  const saveButton = document.createElement("button");
+  saveButton.type = "button";
+  saveButton.className = "control-panel-secondary-button";
+  saveButton.textContent = "保存";
+
+  const status = document.createElement("span");
+  status.className = "control-panel-workspace-status";
+  status.setAttribute("role", "status");
+
+  let current = initial;
+  const sync = () => {
+    saveButton.disabled = input.value.trim().length === 0 || input.value.trim() === current;
+  };
+  sync();
+
+  input.addEventListener("input", () => {
+    status.textContent = "";
+    sync();
+  });
+
+  saveButton.addEventListener("click", async () => {
+    saveButton.disabled = true;
+    input.disabled = true;
+    try {
+      current = await onSave(input.value);
+      input.value = current;
+      status.textContent = "已保存";
+    } catch (err) {
+      status.textContent = err instanceof Error ? err.message : String(err);
+    } finally {
+      input.disabled = false;
+      sync();
+    }
+  });
+
+  controls.append(input, saveButton, status);
+  row.append(copy, controls);
+  return row;
+}
+
 function formatShortcut(value: string): string {
   const labels: Record<string, string> = {
     control: "Ctrl",
@@ -521,6 +589,33 @@ async function renderSettingsSection(content: HTMLElement): Promise<void> {
       "登录 Windows 后自动启动桌面宠物。",
       autostartInitial,
       (next) => invoke<boolean>("set_autostart", { enabled: next }),
+    ),
+  );
+
+  let closeOnBlur = true;
+  try {
+    closeOnBlur = await invoke<boolean>("get_close_on_blur");
+  } catch (err) {
+    console.error("[controlPanelView] get_close_on_blur failed", err);
+  }
+  card.append(
+    createToggleRow(
+      "失焦关闭窗口",
+      "当应用失去焦点时，自动隐藏窗口。",
+      closeOnBlur,
+      (next) => invoke<boolean>("set_close_on_blur", { enabled: next }),
+    ),
+  );
+
+  let workspaceDirectory = "";
+  try {
+    workspaceDirectory = await invoke<string>("get_workspace_directory");
+  } catch (err) {
+    console.error("[controlPanelView] get_workspace_directory failed", err);
+  }
+  card.append(
+    createWorkspaceRow(workspaceDirectory, (directory) =>
+      invoke<string>("set_workspace_directory", { directory }),
     ),
   );
 

@@ -74,7 +74,11 @@ export interface SimpleMessageResponse {
 }
 
 export interface ApiError {
-  detail: string;
+  detail: string | Array<{
+    loc?: Array<string | number>;
+    msg?: string;
+    type?: string;
+  }>;
   code?: string;
 }
 
@@ -117,4 +121,19 @@ export interface TranslationResponse {
   translated_text: string;
   model?: string | null;
   note?: string | null;
+}
+
+export interface FileReaderDocument {
+  page_content: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface FileReaderResponse {
+  file_id: string;
+  file_name: string;
+  file_type: string;
+  text: string;
+  summary: string | null;
+  used_ocr: boolean;
+  documents: FileReaderDocument[];
 }

@@ -14,7 +14,24 @@ import type {
   OCRResponse,
   TranslationRequest,
   TranslationResponse,
+  FileReaderResponse,
 } from "./types";
+
+export type { FileReaderResponse } from "./types";
+
+export interface FileReaderOptions {
+  aiSummary?: boolean;
+}
+
+function formatApiError(payload: unknown, fallback: string): string {
+  if (!payload || typeof payload !== "object") return fallback;
+  const detail = (payload as ApiError).detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail.map((item) => item.msg || item.type || "请求参数错误").join("; ");
+  }
+  return fallback;
+}
 
 export class ApiClient {
   private baseURL: string;
@@ -42,12 +59,13 @@ export class ApiClient {
     const response = await fetch(url, { ...options, headers });
 
     if (!response.ok) {
-      let error: ApiError;
+      let payload: unknown;
       try {
-        error = (await response.json()) as ApiError;
+        payload = await response.json();
       } catch {
-        error = { detail: `HTTP ${response.status}` };
+        payload = undefined;
       }
+      const error = { detail: formatApiError(payload, `HTTP ${response.status}`) };
       throw new Error(error.detail || "请求失败");
     }
 
@@ -120,6 +138,39 @@ export class ApiClient {
       method: "POST",
       body: JSON.stringify(data),
     });
+  }
+
+  async fileReader(
+    file: Blob,
+    fileName: string,
+    mimeType?: string | null,
+    options: FileReaderOptions = {},
+  ): Promise<FileReaderResponse> {
+    const form = new FormData();
+    form.append("ai_summary", String(options.aiSummary ?? false));
+    const upload = mimeType && file.type !== mimeType
+      ? new Blob([file], { type: mimeType })
+      : file;
+    form.append("file", upload, fileName);
+
+    const response = await fetch(`${this.baseURL}/api/v1/tools/file_reader`, {
+      method: "POST",
+      headers: this.getAuthHeader(),
+      body: form,
+    });
+
+    if (!response.ok) {
+      let payload: unknown;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = undefined;
+      }
+      const error = { detail: formatApiError(payload, `HTTP ${response.status}`) };
+      throw new Error(error.detail || "文件读取失败");
+    }
+
+    return (await response.json()) as FileReaderResponse;
   }
 }
 

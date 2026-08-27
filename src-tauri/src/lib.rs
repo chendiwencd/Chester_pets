@@ -1,5 +1,6 @@
 mod clipboard;
 mod commands;
+mod db;
 mod settings;
 mod state;
 mod tray;
@@ -72,6 +73,7 @@ pub fn run() {
         .manage(state::AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::add_text_history_item,
+            commands::create_note_history_item,
             commands::clear_clipboard_history,
             commands::copy_text_to_clipboard,
             commands::close_screenshot_selector,
@@ -79,9 +81,11 @@ pub fn run() {
             commands::complete_screenshot_selection,
             commands::copy_clipboard_history_item,
             commands::delete_clipboard_history_item,
+            commands::get_close_on_blur,
             commands::get_autostart,
             commands::get_monitor_mode,
             commands::get_shortcut_settings,
+            commands::get_workspace_directory,
             commands::log_debug,
             commands::get_clipboard_history,
             commands::open_control_panel,
@@ -90,16 +94,22 @@ pub fn run() {
             commands::open_screenshot_selector,
             commands::open_storage,
             commands::close_preview,
+            commands::complete_file_explanation,
             commands::paste_clipboard_to_input_panel,
-            commands::poll_clipboard,
+            commands::read_file_data_url,
             commands::read_image_data_url,
             commands::recall_pet,
             commands::resize_input_panel,
             commands::save_screenshot_note,
+            commands::save_file_data_url_to_material,
+            commands::save_file_to_material,
             commands::set_autostart,
+            commands::set_close_on_blur,
             commands::show_file_info,
             commands::set_shortcut,
+            commands::set_workspace_directory,
             commands::toggle_pin_clipboard_history_item,
+            commands::update_clipboard_history_item,
             commands::save_pet_position,
             commands::set_panel_visibility,
             commands::set_monitor_mode,
@@ -107,12 +117,13 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle();
             let position = state::load_position(handle);
-            let history = state::load_history(handle);
+            let database = db::Database::open(handle)?;
+            let history = database.load_history()?;
             let mut settings = state::load_settings(handle);
-            settings.shortcuts.storage = normalize_shortcut(
-                &settings.shortcuts.storage,
-                state::DEFAULT_STORAGE_SHORTCUT,
-            );
+            let workspace_dir = state::resolve_workspace_dir(handle, &settings.workspace_dir)
+                .map_err(std::io::Error::other)?;
+            settings.shortcuts.storage =
+                normalize_shortcut(&settings.shortcuts.storage, state::DEFAULT_STORAGE_SHORTCUT);
             settings.shortcuts.screenshot = normalize_shortcut(
                 &settings.shortcuts.screenshot,
                 state::DEFAULT_SCREENSHOT_SHORTCUT,
@@ -135,12 +146,21 @@ pub fn run() {
                 "[setup] loaded settings monitor_mode={}",
                 settings.monitor_mode
             );
+            println!(
+                "[setup] loaded settings close_on_blur={}",
+                settings.close_on_blur
+            );
+            println!(
+                "[setup] workspace directory={}",
+                workspace_dir.to_string_lossy()
+            );
             {
                 let app_state = handle.state::<state::AppState>();
                 *app_state.clipboard_history.lock().unwrap() = history.clone();
-                *app_state.clipboard_history_seq.lock().unwrap() =
-                    history.iter().map(|item| item.id).max().unwrap_or(0);
+                *app_state.database.lock().unwrap() = Some(database);
+                *app_state.workspace_dir.lock().unwrap() = workspace_dir;
                 *app_state.monitor_mode.lock().unwrap() = settings.monitor_mode;
+                *app_state.close_on_blur.lock().unwrap() = settings.close_on_blur;
                 *app_state.shortcuts.lock().unwrap() = settings.shortcuts.clone();
             }
 
@@ -197,11 +217,21 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() == "main" {
+            if window.label() == "main" || window.label() == "panel-web" {
                 if let WindowEvent::DragDrop(drag_event) = event {
                     match drag_event {
                         DragDropEvent::Enter { paths, .. } => {
-                            if !paths.is_empty() {
+                            println!(
+                                "[drag-native] window={} event=enter paths={:?}",
+                                window.label(),
+                                paths
+                            );
+                            if window.label() == "main" && !paths.is_empty() {
+                                *window
+                                    .state::<state::AppState>()
+                                    .file_drag_active
+                                    .lock()
+                                    .unwrap() = true;
                                 let _ = window.app_handle().emit_to(
                                     "main",
                                     "file-drag-state",
@@ -210,28 +240,59 @@ pub fn run() {
                             }
                         }
                         DragDropEvent::Over { .. } => {
-                            let _ = window.app_handle().emit_to(
-                                "main",
-                                "file-drag-state",
-                                FileDragStatePayload { active: true },
-                            );
+                            println!("[drag-native] window={} event=over", window.label());
+                            if window.label() == "main" {
+                                *window
+                                    .state::<state::AppState>()
+                                    .file_drag_active
+                                    .lock()
+                                    .unwrap() = true;
+                                let _ = window.app_handle().emit_to(
+                                    "main",
+                                    "file-drag-state",
+                                    FileDragStatePayload { active: true },
+                                );
+                            }
                         }
                         DragDropEvent::Drop { paths, .. } => {
-                            let _ = window.app_handle().emit_to(
-                                "main",
-                                "file-drag-state",
-                                FileDragStatePayload { active: false },
+                            let target = window.label();
+                            println!(
+                                "[drag-native] window={} event=drop paths={:?}",
+                                target,
+                                paths
                             );
                             if let Some(path) = paths.first() {
-                                commands::show_file_info_for_path(window.app_handle(), path);
+                                let _ = window
+                                    .app_handle()
+                                    .emit_to(target, "file-dropped", path.to_string_lossy().to_string());
+                            }
+                            if window.label() == "main" {
+                                *window
+                                    .state::<state::AppState>()
+                                    .file_drag_active
+                                    .lock()
+                                    .unwrap() = false;
+                                let _ = window.app_handle().emit_to(
+                                    "main",
+                                    "file-drag-state",
+                                    FileDragStatePayload { active: false },
+                                );
                             }
                         }
                         DragDropEvent::Leave => {
-                            let _ = window.app_handle().emit_to(
-                                "main",
-                                "file-drag-state",
-                                FileDragStatePayload { active: false },
-                            );
+                            println!("[drag-native] window={} event=leave", window.label());
+                            if window.label() == "main" {
+                                *window
+                                    .state::<state::AppState>()
+                                    .file_drag_active
+                                    .lock()
+                                    .unwrap() = false;
+                                let _ = window.app_handle().emit_to(
+                                    "main",
+                                    "file-drag-state",
+                                    FileDragStatePayload { active: false },
+                                );
+                            }
                         }
                         _ => {}
                     }
@@ -259,18 +320,33 @@ pub fn run() {
                     if focused_set.is_empty() {
                         // 去抖：窗口切换焦点（main -> preview）可能出现极短暂的“全部失焦”
                         let app = window.app_handle().clone();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(Duration::from_millis(120));
-                            let state = app.state::<state::AppState>();
-                            let still_empty = state.focused_windows.lock().unwrap().is_empty();
-                            let still_same_epoch = *state.focus_epoch.lock().unwrap() == epoch;
-                            if still_empty && still_same_epoch {
-                                println!("[app] deactivated -> hide overlays");
-                                *state.panel_open.lock().unwrap() = false;
-                                commands::hide_all_overlays(&app);
-                                let _ = app.emit_to("main", "app-deactivated", ());
-                            }
-                        });
+                        let file_drag_active = *state.file_drag_active.lock().unwrap();
+                        let close_on_blur = *state.close_on_blur.lock().unwrap();
+                        if file_drag_active {
+                            println!("[app] deactivation skipped during file drag");
+                        } else if !close_on_blur {
+                            println!("[app] deactivation skipped by setting");
+                        } else {
+                            std::thread::spawn(move || {
+                                std::thread::sleep(Duration::from_millis(120));
+                                let state = app.state::<state::AppState>();
+                                let still_empty = state.focused_windows.lock().unwrap().is_empty();
+                                let still_same_epoch = *state.focus_epoch.lock().unwrap() == epoch;
+                                let still_file_drag_active =
+                                    *state.file_drag_active.lock().unwrap();
+                                let still_close_on_blur = *state.close_on_blur.lock().unwrap();
+                                if still_empty
+                                    && still_same_epoch
+                                    && !still_file_drag_active
+                                    && still_close_on_blur
+                                {
+                                    println!("[app] deactivated -> hide overlays");
+                                    *state.panel_open.lock().unwrap() = false;
+                                    commands::hide_all_overlays(&app);
+                                    let _ = app.emit_to("main", "app-deactivated", ());
+                                }
+                            });
+                        }
                     }
                 }
             }

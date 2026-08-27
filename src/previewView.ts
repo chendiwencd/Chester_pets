@@ -1,11 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { resolveImageSrc } from "./media";
+import { createWorkspaceIcon, type WorkspaceIconName } from "./workspaceIcons";
+import { initWorkspaceSettingsPage } from "./workspaceSettingsPage";
 
-// note = 第三个面板手动输入的"记事本"条目，和来自剪贴板的 text/image 区分。
-type PanelKind = "image" | "text" | "web" | "note";
+type PanelKind = "image" | "file" | "text" | "web" | "note";
+type WorkspacePage = "assets" | "notebook" | "chat" | "settings";
+type AssetFilter = "all" | "image" | "text" | "file";
 
-const LAST_VIEWED_KEY = "desktop-shell.preview.last-viewed-id";
+const NOTE_RESOURCE_MARKER = "[[desktop-shell:resources:v1]]";
+const LAST_ASSET_KEY = "desktop-shell.workspace.last-asset-id";
+const LAST_NOTE_KEY = "desktop-shell.workspace.last-note-id";
+const NOTE_ORDER_KEY = "desktop-shell.workspace.note-order";
 
 interface PanelContentPayload {
   id?: number;
@@ -21,25 +27,50 @@ interface ClipboardHistoryItem {
   created_at_ms: number;
   pinned: boolean;
   pinned_at_ms?: number | null;
+  resources?: SavedResource[];
 }
 
-type HistoryFilter = "all" | "text" | "image" | "note";
-
 interface SavedResourceSummary {
-  kind: "text" | "image";
+  id?: number; // 资源的 history item id
+  kind: "text" | "image" | "file";
   name: string;
   summary: string;
   size?: string;
 }
 
-const NOTE_RESOURCE_MARKER = "[[desktop-shell:resources:v1]]";
+interface SavedResource {
+  kind: "text" | "image" | "file";
+  name: string;
+  path?: string | null;
+  summary?: string | null;
+  extracted_text?: string | null;
+  size_bytes?: number | null;
+  mime_type?: string | null;
+  history_item_id?: number;
+}
 
-const FILTERS: Array<{ key: Exclude<HistoryFilter, "all">; title: string }> = [
-  { key: "text", title: "文本" },
-  { key: "image", title: "图片" },
-  { key: "note", title: "记事本" },
-];
+interface AssetSelection {
+  kind: PanelKind;
+  title: string;
+  summary: string;
+  content?: string;
+  createdAtLabel: string;
+  detailLines: Array<{ label: string; value: string }>;
+  imageValue?: string;
+  id?: number;
+  pinned?: boolean;
+}
 
+interface NoteSelection {
+  kind: "note";
+  title: string;
+  summary: string;
+  text: string;
+  resources: SavedResourceSummary[];
+  createdAtLabel: string;
+  id?: number;
+  pinned?: boolean;
+}
 function parseNoteWithResources(value: string): { text: string; resources: SavedResourceSummary[] } {
   const parts = value.split(NOTE_RESOURCE_MARKER);
   if (parts.length < 2) {
@@ -55,472 +86,1805 @@ function parseNoteWithResources(value: string): { text: string; resources: Saved
   }
 }
 
-function renderContent(root: HTMLElement, kind: PanelKind, value: string): void {
-  root.innerHTML = "";
-  if (!value) return;
-
-  if (kind === "image") {
-    const img = document.createElement("img");
-    img.className = "panel-image preview-image-clickable";
-    void resolveImageSrc(value).then((src) => {
-      img.src = src;
-    });
-    img.addEventListener("click", () => {
-      invoke("open_original_image", { value }).catch((err) =>
-        console.error("[previewView] open_original_image failed", err),
-      );
-    });
-    root.appendChild(img);
-    return;
-  }
-
-  if (kind === "note") {
-    const parsed = parseNoteWithResources(value);
-    if (parsed.resources.length > 0) {
-      const container = document.createElement("div");
-      container.className = "preview-note-container";
-
-      const resourcesBlock = document.createElement("div");
-      resourcesBlock.className = "preview-note-resources";
-      for (const resource of parsed.resources) {
-        const card = document.createElement("div");
-        card.className = `preview-note-resource-card preview-note-resource-${resource.kind}`;
-
-        const icon = document.createElement("span");
-        icon.className = `preview-note-resource-icon preview-note-resource-icon-${resource.kind}`;
-        icon.setAttribute("aria-hidden", "true");
-        if (resource.kind === "image") {
-          icon.appendChild(document.createElement("i"));
-        } else {
-          icon.appendChild(document.createElement("i"));
-        }
-
-        const info = document.createElement("div");
-        info.className = "preview-note-resource-info";
-
-        const name = document.createElement("div");
-        name.className = "preview-note-resource-name";
-        name.textContent = resource.name;
-
-        const summary = document.createElement("div");
-        summary.className = "preview-note-resource-summary";
-        summary.textContent = resource.summary;
-
-        info.appendChild(name);
-        info.appendChild(summary);
-        card.appendChild(icon);
-        card.appendChild(info);
-        resourcesBlock.appendChild(card);
-      }
-      container.appendChild(resourcesBlock);
-
-      if (parsed.text) {
-        const textBlock = document.createElement("div");
-        textBlock.className = "preview-note-text";
-        textBlock.textContent = parsed.text;
-        container.appendChild(textBlock);
-      }
-
-      root.appendChild(container);
-      return;
-    }
-  }
-
-  const text = document.createElement("p");
-  text.className = (kind === "web" ? "panel-web-link" : "panel-text") + " preview-text-block";
-  text.textContent = value;
-  root.appendChild(text);
+function normalizeText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
 }
 
-// 时间戳按“距今远近”分档，越近显示得越省略：
-// - 当天：只显示 时:分（HH:mm）
-// - 当年内的其它日期：显示 月-日 时:分（MM-DD HH:mm）
-// - 往年：显示 年-月-日 时:分（YYYY-MM-DD HH:mm）
+function ellipsize(value: string, max: number): string {
+  const text = normalizeText(value);
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
+}
+
+function basenameOf(value: string): string {
+  const normalized = value.replace(/[?#].*$/, "").trim();
+  const segments = normalized.split(/[\\/]/);
+  return segments[segments.length - 1] || value;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${Math.round((bytes / Math.pow(k, i)) * 100) / 100} ${sizes[i]}`;
+}
+
 function formatTime(ms: number): string {
   const d = new Date(ms);
   const now = new Date();
   const p2 = (n: number) => String(n).padStart(2, "0");
-  const hm = `${p2(d.getHours())}:${p2(d.getMinutes())}`;
 
   const sameDay =
     d.getFullYear() === now.getFullYear() &&
     d.getMonth() === now.getMonth() &&
     d.getDate() === now.getDate();
-  if (sameDay) return hm;
 
-  const md = `${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
-  if (d.getFullYear() === now.getFullYear()) return `${md} ${hm}`;
-
-  return `${d.getFullYear()}-${md} ${hm}`;
-}
-
-function createIcon(kind: "text" | "image" | "note", extraClass?: string): HTMLElement {
-  const icon = document.createElement("span");
-  icon.className = `preview-symbol preview-symbol-${kind}${extraClass ? ` ${extraClass}` : ""}`;
-  icon.setAttribute("aria-hidden", "true");
-  if (kind === "image" || kind === "note") {
-    icon.appendChild(document.createElement("i"));
+  if (sameDay) {
+    // 当日：只显示时分
+    return `${p2(d.getHours())}:${p2(d.getMinutes())}`;
   }
-  return icon;
+
+  const sameMonth =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth();
+
+  if (sameMonth) {
+    // 当月非当日：只显示月日
+    return `${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+  }
+
+  // 非当月：显示年月日
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
 }
 
-// 历史条目按类别归组：图片 / 记事本(手动输入) / 文本(剪贴板文本或链接)。
-function groupOf(kind: PanelKind): "image" | "note" | "text" {
-  if (kind === "image") return "image";
-  if (kind === "note") return "note";
-  return "text";
-}
-
-function renderFilters(
-  root: HTMLElement,
-  active: HistoryFilter,
-  onSelect?: (filter: HistoryFilter) => void,
-): void {
-  root.innerHTML = "";
-  for (const filter of FILTERS) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className =
-      `preview-filter filter-${filter.key}` + (filter.key === active ? " is-active" : "");
-    button.title = filter.title;
-    button.setAttribute("aria-label", filter.title);
-    button.appendChild(createIcon(filter.key, "preview-filter-symbol"));
-    button.addEventListener("click", () => onSelect?.(filter.key === active ? "all" : filter.key));
-    root.appendChild(button);
+function kindLabel(kind: PanelKind): string {
+  switch (kind) {
+    case "image":
+      return "图片";
+    case "web":
+      return "文本";
+    case "note":
+      return "记事本";
+    case "file":
+      return "文件";
+    default:
+      return "文本";
   }
 }
 
-function renderHistory(
-  root: HTMLElement,
+function assetTitle(kind: PanelKind, value: string, preview?: string): string {
+  if (kind === "image" || kind === "file") return basenameOf(value);
+  return ellipsize((preview || value).split(/\r?\n/)[0] || "未命名素材", 28) || "未命名素材";
+}
+
+function assetSummary(kind: PanelKind, value: string, preview?: string): string {
+  if (kind === "image") return "点击后查看素材信息";
+  if (kind === "file") return "文件素材";
+  return ellipsize(preview || value || "暂无摘要", 42) || "暂无摘要";
+}
+
+function noteTitle(value: string, preview?: string): string {
+  const parsed = parseNoteWithResources(value);
+  const titleFromPreview = (preview || "").trim();
+  if (titleFromPreview) {
+    return titleFromPreview.split(/\r?\n/)[0] || "未命名便签";
+  }
+  const firstLine = parsed.text.split(/\r?\n/)[0] || "未命名便签";
+  return firstLine;
+}
+
+function noteSummary(value: string, _preview?: string): string {
+  const parsed = parseNoteWithResources(value);
+  if (!parsed.text && parsed.resources.length > 0) {
+    return `${parsed.resources.length} 个关联资源`;
+  }
+  return ellipsize(parsed.text || "暂无正文", 42) || "暂无正文";
+}
+
+function matchesQuery(item: ClipboardHistoryItem, query: string): boolean {
+  if (!query) return true;
+  const parsed = item.kind === "note" ? parseNoteWithResources(item.value) : undefined;
+  const haystack = [
+    item.preview,
+    item.value,
+    parsed?.text,
+    ...(parsed?.resources.map((resource) => `${resource.name} ${resource.summary}`) ?? []),
+  ]
+    .join("\n")
+    .toLowerCase();
+  return haystack.includes(query.toLowerCase());
+}
+
+function sortHistory(items: ClipboardHistoryItem[]): ClipboardHistoryItem[] {
+  return [...items].sort((a, b) => {
+    const aPin = a.pinned ? 1 : 0;
+    const bPin = b.pinned ? 1 : 0;
+    if (aPin !== bPin) return bPin - aPin;
+    if (a.pinned && b.pinned) {
+      return (b.pinned_at_ms ?? 0) - (a.pinned_at_ms ?? 0);
+    }
+    return b.created_at_ms - a.created_at_ms;
+  });
+}
+
+function notebookOrderIds(history: ClipboardHistoryItem[]): number[] {
+  const notes = sortHistory(history.filter((item) => item.kind === "note"));
+  const storedOrder = readNotebookOrder();
+  if (storedOrder.length === 0) {
+    return notes.map((item) => item.id ?? 0).filter((id) => id > 0);
+  }
+  const noteIds = new Set(notes.map((item) => item.id ?? 0));
+  const ordered = storedOrder.filter((id) => noteIds.has(id));
+  const used = new Set(ordered);
+  for (const note of notes) {
+    if (note.id !== undefined && !used.has(note.id)) {
+      ordered.push(note.id);
+      used.add(note.id);
+    }
+  }
+  return ordered;
+}
+
+function assetItems(history: ClipboardHistoryItem[]): ClipboardHistoryItem[] {
+  return sortHistory(history.filter((item) => item.kind !== "note"));
+}
+
+function notebookItems(history: ClipboardHistoryItem[]): ClipboardHistoryItem[] {
+  const notes = history.filter((item) => item.kind === "note");
+  const byId = new Map(sortHistory(notes).map((item) => [item.id ?? 0, item]));
+  const orderedIds = notebookOrderIds(history);
+  if (orderedIds.length === 0) {
+    return sortHistory(notes);
+  }
+  return orderedIds.map((id) => byId.get(id)).filter((item): item is ClipboardHistoryItem => item !== undefined);
+}
+
+function removeNotebookFromOrder(noteId: number): void {
+  const next = readNotebookOrder().filter((id) => id !== noteId);
+  writeNotebookOrder(next);
+}
+
+function filteredAssets(
   history: ClipboardHistoryItem[],
-  filter: HistoryFilter,
-  deleteMode: boolean,
-  activeId?: number,
-  onSelect?: (item: ClipboardHistoryItem) => void,
-): void {
-  root.innerHTML = "";
-  const filtered = history
-    .filter((item) => {
-    if (filter === "all") return true;
-    if (filter === "image") return item.kind === "image";
-    if (filter === "note") return item.kind === "note";
-    // 文本：来自剪贴板的文本/链接，不含记事本
-    return item.kind === "text" || item.kind === "web";
-    })
-    .sort((a, b) => {
-      const aPin = a.pinned ? 1 : 0;
-      const bPin = b.pinned ? 1 : 0;
-      if (aPin !== bPin) return bPin - aPin;
-      if (a.pinned && b.pinned) {
-        return (b.pinned_at_ms ?? 0) - (a.pinned_at_ms ?? 0);
+  filter: AssetFilter,
+  query: string,
+): ClipboardHistoryItem[] {
+  return assetItems(history).filter((item) => {
+    const filterPassed =
+      filter === "all" ||
+      (filter === "image" && item.kind === "image") ||
+      (filter === "text" && (item.kind === "text" || item.kind === "web")) ||
+      (filter === "file" && item.kind === "file");
+    return filterPassed && matchesQuery(item, query);
+  });
+}
+
+function filteredNotes(history: ClipboardHistoryItem[], query: string): ClipboardHistoryItem[] {
+  return notebookItems(history).filter((item) => matchesQuery(item, query));
+}
+
+function assetSelectionFromItem(item: ClipboardHistoryItem): AssetSelection {
+  const resource = item.resources?.find((candidate) => candidate.kind === item.kind) ?? item.resources?.[0];
+  const parsedDescription =
+    resource?.summary?.trim() ||
+    resource?.extracted_text?.trim() ||
+    "";
+  const fallbackDescription =
+    item.kind === "image"
+      ? "图片素材，点击可查看原图。"
+      : item.kind === "file"
+        ? "文件素材。"
+        : normalizeText(item.preview || item.value) || "暂无描述";
+  const description = parsedDescription || fallbackDescription;
+
+  // 监控模式下的纯文本素材：value 保存全文，preview 只是截断标题。
+  // 详情面板需要用全文渲染，避免看起来“只保存了标题”。
+  const content =
+    item.kind === "text" || item.kind === "web"
+      ? item.value
+      : undefined;
+
+  return {
+    kind: item.kind,
+    title: assetTitle(item.kind, item.value, item.preview),
+    summary: description,
+    content,
+    createdAtLabel: formatTime(item.created_at_ms),
+    detailLines: [
+      { label: "名称", value: assetTitle(item.kind, item.value, item.preview) },
+      { label: "类型", value: kindLabel(item.kind) },
+      { label: "导入时间", value: formatTime(item.created_at_ms) },
+      { label: "描述", value: description },
+    ],
+    imageValue: item.kind === "image" ? item.value : undefined,
+    id: item.id,
+    pinned: item.pinned,
+  };
+}
+
+function assetSelectionFromPayload(payload: PanelContentPayload): AssetSelection {
+  return {
+    kind: payload.kind,
+    title: assetTitle(payload.kind, payload.value, payload.value),
+    summary: assetSummary(payload.kind, payload.value, payload.value),
+    content: payload.kind === "text" || payload.kind === "web" ? payload.value : undefined,
+    createdAtLabel: "临时预览",
+    detailLines: [
+      { label: "名称", value: assetTitle(payload.kind, payload.value, payload.value) },
+      { label: "类型", value: kindLabel(payload.kind) },
+      { label: "导入时间", value: "临时预览" },
+      { label: "描述", value: payload.kind === "image" ? "图片素材，点击可查看原图。" : payload.kind === "file" ? "文件素材。" : normalizeText(payload.value) || "暂无描述" },
+    ],
+    imageValue: payload.kind === "image" ? payload.value : undefined,
+  };
+}
+
+function noteSelectionFromItem(item: ClipboardHistoryItem): NoteSelection {
+  const parsed = parseNoteWithResources(item.value);
+  return {
+    kind: "note",
+    title: noteTitle(item.value, item.preview),
+    summary: noteSummary(item.value, item.preview),
+    text: parsed.text,
+    resources: parsed.resources,
+    createdAtLabel: formatTime(item.created_at_ms),
+    id: item.id,
+    pinned: item.pinned,
+  };
+}
+
+function noteSelectionFromPayload(payload: PanelContentPayload): NoteSelection {
+  const parsed = parseNoteWithResources(payload.value);
+  return {
+    kind: "note",
+    title: noteTitle(payload.value, payload.value),
+    summary: noteSummary(payload.value, payload.value),
+    text: parsed.text,
+    resources: parsed.resources,
+    createdAtLabel: "临时查看",
+  };
+}
+
+function workspacePlaceholder(page: WorkspacePage): string {
+  if (page === "assets") return "搜索素材、文件或标签";
+  if (page === "notebook") return "搜索便签、分类或正文";
+  if (page === "settings") return "设置页不支持搜索";
+  return "搜索消息、文件或任务";
+}
+
+function safeStore(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // ignore storage failures
+  }
+}
+
+function safeRead(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function readNotebookOrder(): number[] {
+  const raw = safeRead(NOTE_ORDER_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    const order: number[] = [];
+    const seen = new Set<number>();
+    for (const value of parsed) {
+      const id = Number(value);
+      if (Number.isInteger(id) && id > 0 && !seen.has(id)) {
+        seen.add(id);
+        order.push(id);
       }
-      return b.created_at_ms - a.created_at_ms;
+    }
+    return order;
+  } catch {
+    return [];
+  }
+}
+
+function writeNotebookOrder(order: number[]): void {
+  safeStore(NOTE_ORDER_KEY, JSON.stringify(order));
+}
+
+function createEmptyState(title: string, detail: string): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.className = "workspace-empty";
+  const heading = document.createElement("div");
+  heading.className = "workspace-empty-title";
+  heading.textContent = title;
+  const desc = document.createElement("div");
+  desc.className = "workspace-empty-desc";
+  desc.textContent = detail;
+  wrap.appendChild(heading);
+  wrap.appendChild(desc);
+  return wrap;
+}
+
+function renderAssetFilters(root: HTMLElement, active: AssetFilter, onSelect: (filter: AssetFilter) => void): void {
+  const filters: Array<{ key: AssetFilter; label: string }> = [
+    { key: "all", label: "全部" },
+    { key: "image", label: "图片" },
+    { key: "file", label: "文件" },
+    { key: "text", label: "文本" },
+  ];
+  root.innerHTML = "";
+  for (const filter of filters) {
+    const pill = document.createElement("button");
+    pill.type = "button";
+    pill.className = "workspace-filter-pill" + (filter.key === active ? " is-active" : "");
+    pill.textContent = filter.label;
+    pill.addEventListener("click", () => onSelect(filter.key));
+    root.appendChild(pill);
+  }
+}
+
+function renderAssetGrid(
+  root: HTMLElement,
+  items: ClipboardHistoryItem[],
+  activeId: number | undefined,
+  onSelect: (item: ClipboardHistoryItem) => void,
+): void {
+  const listKey = items.map((item) => String(item.id ?? "")).join("|");
+  // 仅切换选中项时，不要重建整个网格（否则所有图片 <img> 会被重新创建并闪烁刷新）
+  if (root.dataset.assetListKey === listKey && root.childElementCount > 0) {
+    root.querySelectorAll<HTMLElement>(".workspace-asset-card").forEach((node) => {
+      const id = Number(node.dataset.assetId || "");
+      node.classList.toggle("is-active", Number.isFinite(id) && id === activeId);
     });
-  if (filtered.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "preview-history-empty";
-    empty.textContent = filter === "all" ? "还没有复制内容" : "该分类下还没有内容";
-    root.appendChild(empty);
     return;
   }
 
-  for (const item of filtered) {
-    const group = groupOf(item.kind);
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className =
-      `preview-history-item group-${group}` +
-      (item.pinned ? " is-pinned" : "") +
-      (item.id === activeId ? " is-active" : "");
-
-    const meta = document.createElement("div");
-    meta.className = "preview-history-meta";
-
-    const iconWrap = document.createElement("span");
-    iconWrap.className = `preview-history-icon group-${group}`;
-    iconWrap.appendChild(createIcon(group));
-
-    const kind = document.createElement("span");
-    kind.className = "preview-history-kind";
-    kind.textContent = formatTime(item.created_at_ms);
-
-    meta.appendChild(iconWrap);
-    meta.appendChild(kind);
-    if (deleteMode) {
-      const deleteItemBtn = document.createElement("button");
-      deleteItemBtn.type = "button";
-      deleteItemBtn.className = "preview-history-inline-delete";
-      deleteItemBtn.textContent = "×";
-      deleteItemBtn.title = "删除";
-      deleteItemBtn.setAttribute("aria-label", "删除");
-      deleteItemBtn.addEventListener("click", (event) => {
-        event.stopPropagation();
-        invoke("delete_clipboard_history_item", { id: item.id }).catch((err) =>
-          console.error("[previewView] delete_clipboard_history_item failed", err),
-        );
+  root.dataset.assetListKey = listKey;
+  root.innerHTML = "";
+  if (items.length === 0) {
+    root.appendChild(createEmptyState("暂无素材", "当前筛选条件下没有可显示的素材。"));
+    return;
+  }
+  for (const item of items) {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "workspace-asset-card" + (item.id === activeId ? " is-active" : "");
+    if (item.id !== undefined) {
+      card.dataset.assetId = String(item.id);
+    }
+    const preview = document.createElement("div");
+    preview.className = `workspace-asset-preview kind-${item.kind}`;
+    if (item.kind === "image") {
+      const image = document.createElement("img");
+      image.className = "workspace-asset-preview-image";
+      void resolveImageSrc(item.value).then((src) => {
+        image.src = src;
       });
-      meta.appendChild(deleteItemBtn);
+      preview.appendChild(image);
+    } else {
+      const iconName: WorkspaceIconName = "file-text";
+      const icon = createWorkspaceIcon(
+        iconName,
+        `workspace-inline-icon workspace-asset-preview-icon kind-${item.kind}`,
+      );
+      preview.appendChild(icon);
     }
-    button.appendChild(meta);
-
-    if (item.kind !== "image") {
-      const preview = document.createElement("span");
-      preview.className = "preview-history-preview";
-      // 记事本条目只显示正文，不显示资源 JSON
-      if (item.kind === "note") {
-        const parsed = parseNoteWithResources(item.value);
-        preview.textContent = parsed.text || "(空)";
-      } else {
-        preview.textContent = item.preview || "(空)";
-      }
-      button.appendChild(preview);
-    }
-
-    button.addEventListener("click", () => onSelect?.(item));
-    root.appendChild(button);
+    const title = document.createElement("div");
+    title.className = "workspace-asset-title";
+    title.textContent = assetTitle(item.kind, item.value, item.preview);
+    const meta = document.createElement("div");
+    meta.className = "workspace-asset-meta";
+    meta.textContent = `${formatTime(item.created_at_ms)} · ${kindLabel(item.kind)}`;
+    card.append(preview, title, meta);
+    card.addEventListener("click", () => onSelect(item));
+    root.appendChild(card);
   }
 }
 
-export async function initPreviewView(root: HTMLElement): Promise<void> {
-  const appWindow = getCurrentWindow();
-  const historyRoot = document.getElementById("preview-history");
-  const filterRoot = document.getElementById("preview-filters");
-  const clearBtn = document.getElementById("preview-clear");
-  const pinBtn = document.getElementById("preview-pin");
-  const copyBtn = document.getElementById("preview-copy");
-  const deleteBtn = document.getElementById("preview-delete");
-  let history: ClipboardHistoryItem[] = [];
-  let activeId: number | undefined;
-  let activeFilter: HistoryFilter = "all";
-  let deleteMode = false;
-  let monitorMode = false;
+function renderAssetDetail(
+  root: HTMLElement,
+  selection: AssetSelection | undefined,
+  onPin?: () => void,
+  onCopy?: () => void,
+  onDelete?: () => void,
+): void {
+  root.innerHTML = "";
+  if (!selection) {
+    root.appendChild(createEmptyState("素材信息", "从左侧选择一项素材后，这里会显示详细信息。"));
+    return;
+  }
 
-  const activeItem = () => history.find((item) => item.id === activeId);
+  // 文本类型：详情面板仅显示内容（不显示名称/类型/时间/概述等信息）
+  if (selection.kind === "text" || selection.kind === "web") {
+    const header = document.createElement("div");
+    header.className = "workspace-detail-header";
+    const kicker = document.createElement("p");
+    kicker.className = "workspace-kicker";
+    kicker.textContent = "内容";
+    header.appendChild(kicker);
+    root.appendChild(header);
 
-  const renderHistoryList = () => {
-    if (historyRoot) renderHistory(historyRoot, history, activeFilter, deleteMode, activeId, selectItem);
+    const scroll = document.createElement("div");
+    scroll.className = "workspace-detail-scroll";
+    const content = document.createElement("div");
+    content.className = "workspace-detail-text";
+    content.textContent = selection.content ?? selection.summary ?? "";
+    scroll.appendChild(content);
+    root.appendChild(scroll);
+
+    if (selection.id) {
+      const footer = document.createElement("div");
+      footer.className = "workspace-detail-actions";
+      const pin = document.createElement("button");
+      pin.type = "button";
+      pin.className = "workspace-action-button";
+      pin.textContent = selection.pinned ? "取消置顶" : "置顶";
+      pin.addEventListener("click", () => onPin?.());
+      const copyButton = document.createElement("button");
+      copyButton.type = "button";
+      copyButton.className = "workspace-action-button";
+      copyButton.textContent = "复制";
+      copyButton.addEventListener("click", () => onCopy?.());
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.className = "workspace-action-button is-danger";
+      deleteButton.textContent = "删除";
+      deleteButton.addEventListener("click", () => onDelete?.());
+      footer.append(pin, copyButton, deleteButton);
+      root.appendChild(footer);
+    }
+    return;
+  }
+
+  const header = document.createElement("div");
+  header.className = "workspace-detail-header";
+  const kicker = document.createElement("p");
+  kicker.className = "workspace-kicker";
+  kicker.textContent = "素材信息";
+  const status = document.createElement("span");
+  status.className = "workspace-status-pill is-soft";
+  status.textContent = selection.pinned ? "已置顶" : selection.createdAtLabel;
+  header.appendChild(kicker);
+  root.appendChild(header);
+
+  const detailScroll = document.createElement("div");
+  detailScroll.className = "workspace-detail-scroll";
+
+  if (selection.imageValue) {
+    const media = document.createElement("button");
+    media.type = "button";
+    media.className = "workspace-detail-image";
+    const image = document.createElement("img");
+    void resolveImageSrc(selection.imageValue).then((src) => {
+      image.src = src;
+    });
+    media.appendChild(image);
+    media.addEventListener("click", () => {
+      invoke("open_original_image", { value: selection.imageValue }).catch(() => {});
+    });
+    detailScroll.appendChild(media);
+  }
+
+  const fields = document.createElement("div");
+  fields.className = "workspace-detail-fields";
+  for (const [index, line] of selection.detailLines.entries()) {
+    const isOverview = index === selection.detailLines.length - 1;
+    const field = document.createElement("div");
+    field.className = "workspace-detail-field";
+    const label = document.createElement("p");
+    label.className = "workspace-detail-field-label";
+    label.textContent = isOverview ? "概述" : line.label;
+    const value = document.createElement("p");
+    value.className = `workspace-detail-field-value${isOverview ? " workspace-detail-overview-value" : ""}`;
+    value.textContent = line.value;
+    if (isOverview) {
+      const overview = document.createElement("div");
+      overview.className = "workspace-detail-overview";
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "workspace-detail-overview-toggle";
+      toggle.textContent = "...";
+      toggle.title = "查看完整概述";
+      toggle.setAttribute("aria-label", "查看完整概述");
+      toggle.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const expanded = value.classList.toggle("is-expanded");
+        // 兜底：部分环境下 class 切换可能被其它样式覆盖，这里补一层 inline style 保证展开/收起生效。
+        if (expanded) {
+          (value as HTMLElement).style.display = "block";
+          (value as HTMLElement).style.maxHeight = "none";
+          (value as HTMLElement).style.overflow = "visible";
+          (value as HTMLElement).style.setProperty("-webkit-line-clamp", "unset");
+        } else {
+          (value as HTMLElement).style.removeProperty("display");
+          (value as HTMLElement).style.removeProperty("max-height");
+          (value as HTMLElement).style.removeProperty("overflow");
+          (value as HTMLElement).style.removeProperty("-webkit-line-clamp");
+        }
+        toggle.title = expanded ? "收起概述" : "查看完整概述";
+        toggle.setAttribute("aria-label", expanded ? "收起概述" : "查看完整概述");
+        toggle.textContent = expanded ? "收起" : "...";
+      });
+      overview.append(value, toggle);
+      field.append(label, overview);
+
+      // 如果概述内容没有溢出（两行以内），不显示 ... 按钮，同时去掉右侧预留 padding
+      const syncToggleVisibility = () => {
+        const valueEl = value as HTMLElement;
+        const toggleEl = toggle as HTMLElement;
+        // 已展开时保留 toggle（用于收起），且本身就说明存在“可展开”需求
+        if (valueEl.classList.contains("is-expanded")) {
+          toggleEl.style.display = "";
+          valueEl.style.paddingRight = "24px";
+          return;
+        }
+
+        const rect = valueEl.getBoundingClientRect();
+        if (!rect.width || !rect.height) {
+          // 还没布局完成，延迟一帧再测
+          requestAnimationFrame(syncToggleVisibility);
+          return;
+        }
+
+        const probe = document.createElement("div");
+        probe.textContent = valueEl.textContent || "";
+        const style = window.getComputedStyle(valueEl);
+        probe.style.position = "absolute";
+        probe.style.visibility = "hidden";
+        probe.style.pointerEvents = "none";
+        probe.style.left = "0";
+        probe.style.top = "0";
+        probe.style.width = `${rect.width}px`;
+        probe.style.font = style.font;
+        probe.style.fontSize = style.fontSize;
+        probe.style.fontFamily = style.fontFamily;
+        probe.style.fontWeight = style.fontWeight;
+        probe.style.lineHeight = style.lineHeight;
+        probe.style.letterSpacing = style.letterSpacing;
+        probe.style.whiteSpace = "normal";
+        probe.style.wordBreak = style.wordBreak;
+        probe.style.overflowWrap = style.overflowWrap as string;
+        probe.style.maxHeight = "none";
+        probe.style.overflow = "visible";
+        probe.style.display = "block";
+        overview.appendChild(probe);
+        const expandedHeight = probe.scrollHeight;
+        probe.remove();
+
+        const clampedHeight = rect.height;
+        const overflow = expandedHeight > clampedHeight + 1;
+        toggleEl.style.display = overflow ? "" : "none";
+        valueEl.style.paddingRight = overflow ? "24px" : "0";
+      };
+      requestAnimationFrame(syncToggleVisibility);
+    } else {
+      field.append(label, value);
+    }
+    fields.appendChild(field);
+  }
+  detailScroll.appendChild(fields);
+  root.appendChild(detailScroll);
+
+  if (selection.id) {
+    const footer = document.createElement("div");
+    footer.className = "workspace-detail-actions";
+    const pin = document.createElement("button");
+    pin.type = "button";
+    pin.className = "workspace-action-button";
+    pin.textContent = selection.pinned ? "取消置顶" : "置顶";
+    pin.addEventListener("click", () => onPin?.());
+    const copyButton = document.createElement("button");
+    copyButton.type = "button";
+    copyButton.className = "workspace-action-button";
+    copyButton.textContent = "复制";
+    copyButton.addEventListener("click", () => onCopy?.());
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "workspace-action-button is-danger";
+    deleteButton.textContent = "删除";
+    deleteButton.addEventListener("click", () => onDelete?.());
+    footer.append(pin, copyButton, deleteButton);
+    root.appendChild(footer);
+  }
+}
+
+function renderNotebookList(
+  root: HTMLElement,
+  items: ClipboardHistoryItem[],
+  activeId: number | undefined,
+  manageMode: boolean,
+  onSelect: (item: ClipboardHistoryItem) => void,
+  onPin: (item: ClipboardHistoryItem) => void,
+  onDelete: (item: ClipboardHistoryItem) => void,
+): void {
+  root.innerHTML = "";
+  if (items.length === 0) {
+    root.appendChild(createEmptyState("暂无便签", "保存一条记事本内容后，这里会同步出现。"));
+    return;
+  }
+  for (const item of items) {
+    const card = document.createElement("div");
+    card.className = "workspace-note-card" + (item.id === activeId ? " is-active" : "") + (manageMode ? " is-managing" : "");
+    const main = document.createElement("button");
+    main.type = "button";
+    main.className = "workspace-note-card-main";
+    const row = document.createElement("div");
+    row.className = "workspace-note-card-top";
+    const title = document.createElement("h3");
+    title.className = "workspace-note-card-title";
+    title.textContent = noteTitle(item.value, item.preview);
+    const badge = document.createElement("span");
+    badge.className = "workspace-note-card-badge";
+    badge.textContent = item.pinned ? "置顶" : formatTime(item.created_at_ms);
+    row.append(title, badge);
+    const summary = document.createElement("p");
+    summary.className = "workspace-note-card-summary";
+    summary.textContent = noteSummary(item.value, item.preview);
+    main.append(row, summary);
+    main.addEventListener("click", () => onSelect(item));
+
+    const actions = document.createElement("div");
+    actions.className = "workspace-note-card-actions";
+    const pinButton = document.createElement("button");
+    pinButton.type = "button";
+    pinButton.className = "workspace-icon-button workspace-note-card-action";
+    pinButton.setAttribute("aria-label", item.pinned ? "取消置顶" : "置顶");
+    pinButton.title = item.pinned ? "取消置顶" : "置顶";
+    pinButton.appendChild(createWorkspaceIcon("pin", "workspace-inline-icon workspace-note-card-action-icon"));
+    pinButton.classList.toggle("is-active", item.pinned);
+    pinButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      onPin(item);
+    });
+
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "workspace-icon-button workspace-note-card-action is-danger";
+    deleteButton.setAttribute("aria-label", "删除");
+    deleteButton.title = "删除";
+    deleteButton.appendChild(createWorkspaceIcon("trash-2", "workspace-inline-icon workspace-note-card-action-icon"));
+    deleteButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      onDelete(item);
+    });
+    actions.append(pinButton, deleteButton);
+
+    card.append(main, actions);
+    root.appendChild(card);
+  }
+}
+
+function renderNotebookDetail(
+  root: HTMLElement,
+  selection: NoteSelection | undefined,
+  onPin?: () => void,
+  onCopy?: () => void,
+  onDelete?: () => void,
+  onSave?: (title: string, text: string) => void,
+  allMaterials?: SavedResourceSummary[],
+  editorState?: { isEditing: boolean; title: string; text: string },
+  onEditorStateChange?: (next: { isEditing: boolean; title: string; text: string }) => void,
+): void {
+  root.innerHTML = "";
+  if (!selection) {
+    root.appendChild(createEmptyState("便签正文", "从左侧选择一条便签后，这里会展示正文与关联素材。"));
+    return;
+  }
+
+  let isEditing = editorState?.isEditing ?? false;
+  let editedTitle = editorState?.title ?? selection.title;
+  let editedText = editorState?.text ?? selection.text;
+  let saveTimeout: number | undefined;
+  let drawerMaterial: SavedResourceSummary | undefined;
+  let drawerRoot: HTMLElement | undefined;
+  let drawerTitle: HTMLElement | undefined;
+  let drawerBody: HTMLElement | undefined;
+  let getCurrentTitle: () => string = () => editedTitle;
+  let getCurrentText: () => string = () => editedText;
+
+  const autoSave = () => {
+    if (saveTimeout !== undefined) {
+      clearTimeout(saveTimeout);
+    }
+    saveTimeout = window.setTimeout(() => {
+      if (isEditing && onSave) {
+        // 不依赖缓存变量，直接读取当前 DOM 状态，避免偶发截断/丢字符
+        const currentTitle = getCurrentTitle();
+        const currentText = getCurrentText();
+        editedTitle = currentTitle;
+        editedText = currentText;
+        onEditorStateChange?.({ isEditing: true, title: currentTitle, text: currentText });
+        onSave(currentTitle, currentText);
+      }
+    }, 1000);
   };
 
-  const syncActionButtons = () => {
-    const disabled = activeId === undefined;
-    if (clearBtn instanceof HTMLButtonElement) {
-      clearBtn.classList.toggle("is-delete-mode", deleteMode);
-      clearBtn.title = deleteMode ? "退出删除模式" : "进入删除模式";
-      clearBtn.setAttribute("aria-label", deleteMode ? "退出删除模式" : "进入删除模式");
+  const materialKindLabel = (kind: SavedResourceSummary["kind"]) =>
+    kind === "text" ? "文本" : kind === "image" ? "图片" : "文件";
+
+  const ensureDrawer = (): { drawer: HTMLElement; title: HTMLElement; body: HTMLElement } => {
+    if (drawerRoot && drawerTitle && drawerBody) {
+      return { drawer: drawerRoot, title: drawerTitle, body: drawerBody };
     }
-    if (pinBtn instanceof HTMLButtonElement) {
-      pinBtn.disabled = disabled;
-      pinBtn.textContent = activeItem()?.pinned ? "取消置顶" : "置顶";
-    }
-    if (copyBtn instanceof HTMLButtonElement) copyBtn.disabled = disabled;
-    if (deleteBtn instanceof HTMLButtonElement) deleteBtn.disabled = disabled;
+    const drawer = document.createElement("div");
+    drawer.className = "workspace-material-drawer";
+    drawer.setAttribute("aria-hidden", "true");
+
+    const backdrop = document.createElement("div");
+    backdrop.className = "workspace-material-drawer-backdrop";
+    backdrop.addEventListener("click", () => {
+      drawerMaterial = undefined;
+      drawer.classList.remove("is-open");
+      drawer.setAttribute("aria-hidden", "true");
+    });
+
+    const sheet = document.createElement("div");
+    sheet.className = "workspace-material-drawer-sheet";
+
+    const header = document.createElement("div");
+    header.className = "workspace-material-drawer-header";
+    const title = document.createElement("div");
+    title.className = "workspace-material-drawer-title";
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "workspace-icon-button";
+    closeBtn.type = "button";
+    closeBtn.setAttribute("aria-label", "关闭");
+    closeBtn.title = "关闭";
+    closeBtn.appendChild(createWorkspaceIcon("x", "workspace-inline-icon"));
+    closeBtn.addEventListener("click", () => {
+      drawerMaterial = undefined;
+      drawer.classList.remove("is-open");
+      drawer.setAttribute("aria-hidden", "true");
+    });
+    header.append(title, closeBtn);
+
+    const body = document.createElement("div");
+    body.className = "workspace-material-drawer-body";
+
+    sheet.append(header, body);
+    drawer.append(backdrop, sheet);
+    root.appendChild(drawer);
+
+    drawerRoot = drawer;
+    drawerTitle = title;
+    drawerBody = body;
+    return { drawer, title, body };
   };
 
-  const selectItem = (item: ClipboardHistoryItem) => {
-    activeId = item.id;
-    renderContent(root, item.kind, item.value);
-    renderHistoryList();
-    syncActionButtons();
-    // 记住用户上次查看的记录
-    try {
-      localStorage.setItem(LAST_VIEWED_KEY, String(item.id));
-    } catch {
-      // ignore storage failures
+  const openMaterialDrawer = (material: SavedResourceSummary) => {
+    drawerMaterial = material;
+    const { drawer, title, body } = ensureDrawer();
+
+    title.textContent = material.name;
+    body.innerHTML = "";
+
+    const grid = document.createElement("div");
+    grid.className = "workspace-material-drawer-grid";
+
+    const addRow = (labelText: string, valueText: string) => {
+      const label = document.createElement("div");
+      label.className = "workspace-material-drawer-label";
+      label.textContent = labelText;
+      const value = document.createElement("div");
+      value.className = "workspace-material-drawer-value";
+      value.textContent = valueText;
+      grid.append(label, value);
+    };
+
+    addRow("类型", materialKindLabel(material.kind));
+    if (material.size) addRow("大小", material.size);
+    addRow("概览", material.summary?.trim() || "暂无概览");
+
+    body.appendChild(grid);
+    drawer.classList.add("is-open");
+    drawer.setAttribute("aria-hidden", "false");
+  };
+
+  const render = () => {
+    root.innerHTML = "";
+    drawerRoot = undefined;
+    drawerTitle = undefined;
+    drawerBody = undefined;
+    root.style.position = "relative";
+
+    const header = document.createElement("div");
+    header.className = "workspace-detail-header";
+    const headerCopy = document.createElement("div");
+    headerCopy.className = "workspace-detail-header-copy";
+
+    if (isEditing) {
+      // 编辑模式：标题可编辑
+      const titleInput = document.createElement("input");
+      titleInput.type = "text";
+      titleInput.className = "workspace-detail-title-input";
+      titleInput.value = editedTitle;
+      titleInput.placeholder = "便签标题";
+      titleInput.addEventListener("input", () => {
+        editedTitle = titleInput.value;
+        onEditorStateChange?.({ isEditing: true, title: editedTitle, text: editedText });
+        autoSave();
+      });
+      headerCopy.appendChild(titleInput);
+      getCurrentTitle = () => titleInput.value;
+    } else {
+      // 查看模式：标题只读
+      const title = document.createElement("h3");
+      title.className = "workspace-detail-title";
+      title.textContent = selection.title;
+      headerCopy.appendChild(title);
     }
-    // 滚动到选中的记录
-    requestAnimationFrame(() => {
-      if (historyRoot) {
-        const activeButton = historyRoot.querySelector(".preview-history-item.is-active");
-        if (activeButton instanceof HTMLElement) {
-          activeButton.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    const badges = document.createElement("div");
+    badges.className = "workspace-detail-badges";
+
+    if (selection.id) {
+      const editButton = document.createElement("button");
+      editButton.type = "button";
+      editButton.className = "workspace-icon-button";
+      editButton.setAttribute("aria-label", isEditing ? "完成编辑" : "编辑便签");
+      editButton.title = isEditing ? "完成编辑" : "编辑便签";
+      editButton.appendChild(createWorkspaceIcon(isEditing ? "check" : "pencil", "workspace-inline-icon"));
+      editButton.addEventListener("click", () => {
+        if (isEditing && saveTimeout !== undefined) {
+          clearTimeout(saveTimeout);
+          onSave?.(editedTitle, editedText);
+        }
+        isEditing = !isEditing;
+        onEditorStateChange?.({ isEditing, title: editedTitle, text: editedText });
+        render();
+      });
+      badges.appendChild(editButton);
+
+      const pinButton = document.createElement("button");
+      pinButton.type = "button";
+      pinButton.className = "workspace-icon-button";
+      pinButton.setAttribute("aria-label", selection.pinned ? "取消置顶" : "置顶");
+      pinButton.title = selection.pinned ? "取消置顶" : "置顶";
+      pinButton.appendChild(createWorkspaceIcon("pin", "workspace-inline-icon workspace-note-pin-icon"));
+      pinButton.classList.toggle("is-active", selection.pinned);
+      pinButton.addEventListener("click", () => onPin?.());
+      badges.appendChild(pinButton);
+    }
+    header.append(headerCopy, badges);
+    root.appendChild(header);
+
+    if (isEditing) {
+      // 编辑模式
+      const editorWrap = document.createElement("div");
+      editorWrap.className = "workspace-note-editor";
+      editorWrap.style.position = "relative";
+
+      const materials: SavedResourceSummary[] = Array.isArray(allMaterials) ? allMaterials : [];
+      const materialsById = new Map<number, SavedResourceSummary>();
+      for (const item of materials) {
+        if (typeof item.id === "number") materialsById.set(item.id, item);
+      }
+
+      const createMention = (material: SavedResourceSummary) => {
+        const mention = document.createElement("span");
+        mention.className = "workspace-mention";
+        if (material.id !== undefined) {
+          mention.dataset.fileId = String(material.id);
+        }
+        mention.textContent = `@${material.name}`;
+        mention.setAttribute("contenteditable", "false");
+        mention.style.cursor = "pointer";
+        mention.addEventListener("click", () => openMaterialDrawer(material));
+        return mention;
+      };
+
+      const editor = document.createElement("div");
+      editor.className = "workspace-note-editor-rich";
+      editor.contentEditable = "true";
+      editor.setAttribute("role", "textbox");
+      editor.setAttribute("aria-multiline", "true");
+      editor.setAttribute("data-placeholder", "输入便签内容...");
+
+      const renderEditorFromText = (text: string) => {
+        editor.innerHTML = "";
+        if (!text) return;
+        const parts = text.split(/(@file_id_\d+)/g);
+        for (const part of parts) {
+          const match = part.match(/^@file_id_(\d+)$/);
+          if (match) {
+            const fileId = Number(match[1]);
+            const material = materialsById.get(fileId);
+            if (material) {
+              editor.appendChild(createMention(material));
+              continue;
+            }
+          }
+          const lines = part.split(/\n/g);
+          for (let i = 0; i < lines.length; i++) {
+            if (lines[i]) editor.appendChild(document.createTextNode(lines[i]));
+            if (i < lines.length - 1) editor.appendChild(document.createElement("br"));
+          }
+        }
+      };
+
+      const serializeEditorText = () => {
+        const chunks: string[] = [];
+        const walk = (node: Node) => {
+          if (node.nodeType === Node.TEXT_NODE) {
+            chunks.push((node as Text).data);
+            return;
+          }
+          if (node.nodeType !== Node.ELEMENT_NODE) return;
+          const el = node as HTMLElement;
+          if (el.classList.contains("workspace-mention") && el.dataset.fileId) {
+            chunks.push(`@file_id_${el.dataset.fileId}`);
+            return;
+          }
+          if (el.tagName === "BR") {
+            chunks.push("\n");
+            return;
+          }
+          for (const child of Array.from(el.childNodes)) {
+            walk(child);
+          }
+          // contenteditable 可能会产生 div/p 作为换行容器
+          if (el !== editor && (el.tagName === "DIV" || el.tagName === "P")) {
+            chunks.push("\n");
+          }
+        };
+        for (const child of Array.from(editor.childNodes)) walk(child);
+        return chunks.join("").replace(/\n{3,}/g, "\n\n");
+      };
+
+      const setCaretAfter = (node: Node) => {
+        const range = document.createRange();
+        range.setStartAfter(node);
+        range.collapse(true);
+        const sel = window.getSelection();
+        sel?.removeAllRanges();
+        sel?.addRange(range);
+        editor.focus();
+      };
+
+      // 自动补全相关状态
+      let autocompleteVisible = false;
+      let autocompleteSelectedIndex = 0;
+      let mentionQueryNode: Text | null = null;
+      let mentionQueryAtIndex = 0;
+
+      const autocompleteDropdown = document.createElement("div");
+      autocompleteDropdown.className = "workspace-autocomplete-dropdown";
+      autocompleteDropdown.style.display = "none";
+
+      const hideAutocomplete = () => {
+        autocompleteDropdown.style.display = "none";
+        autocompleteVisible = false;
+        autocompleteSelectedIndex = 0;
+        mentionQueryNode = null;
+        mentionQueryAtIndex = 0;
+      };
+
+      const caretRectForRange = (range: Range) => {
+        const rect = range.getBoundingClientRect();
+        if ((rect.width > 0 || rect.height > 0) && Number.isFinite(rect.left) && Number.isFinite(rect.top)) {
+          return rect;
+        }
+        if (range.startContainer.nodeType === Node.TEXT_NODE) {
+          const node = range.startContainer as Text;
+          if (range.startOffset > 0) {
+            const fallback = range.cloneRange();
+            fallback.setStart(node, range.startOffset - 1);
+            fallback.setEnd(node, range.startOffset);
+            const fr = fallback.getBoundingClientRect();
+            // 光标一般位于字符右侧
+            return new DOMRect(fr.right, fr.bottom, 0, 0);
+          }
+        }
+        return rect;
+      };
+
+      const positionAutocomplete = (range: Range) => {
+        const wrapRect = editorWrap.getBoundingClientRect();
+        const caretRect = caretRectForRange(range);
+        // 先展示（但隐藏）以便测量尺寸
+        const wasHidden = autocompleteDropdown.style.display === "none";
+        const previousVisibility = autocompleteDropdown.style.visibility;
+        autocompleteDropdown.style.visibility = "hidden";
+        autocompleteDropdown.style.display = "block";
+
+        const dropdownWidth = Math.max(220, autocompleteDropdown.offsetWidth || 0);
+        const dropdownHeight = Math.max(120, autocompleteDropdown.offsetHeight || 0);
+
+        let left = caretRect.left - wrapRect.left;
+        const below = caretRect.bottom - wrapRect.top + 6;
+        const above = caretRect.top - wrapRect.top - dropdownHeight - 6;
+        let top = below;
+
+        // 底部不够则向上翻转
+        if (below + dropdownHeight > wrapRect.height - 8 && above >= 8) {
+          top = above;
+        }
+
+        // 边缘吸附/限制在容器内
+        left = Math.min(Math.max(8, left), Math.max(8, wrapRect.width - dropdownWidth - 8));
+        top = Math.min(Math.max(8, top), Math.max(8, wrapRect.height - dropdownHeight - 8));
+
+        autocompleteDropdown.style.left = `${left}px`;
+        autocompleteDropdown.style.top = `${top}px`;
+
+        // 还原可见性
+        autocompleteDropdown.style.visibility = previousVisibility;
+        if (wasHidden) {
+          autocompleteDropdown.style.display = "none";
+        }
+      };
+
+      const insertMentionForMaterial = (material: SavedResourceSummary) => {
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return;
+        const range = sel.getRangeAt(0);
+        range.deleteContents();
+
+        // 如果当前在 @ 查询态，尽量把 '@xxx' 整段替换成 mention
+        if (mentionQueryNode && sel.anchorNode === mentionQueryNode) {
+          const textNode = mentionQueryNode;
+          const caretOffset = sel.anchorOffset;
+          const full = textNode.data;
+          const before = full.slice(0, mentionQueryAtIndex);
+          const after = full.slice(caretOffset);
+          textNode.data = before;
+
+          const mentionEl = createMention(material);
+          const afterNode = document.createTextNode(after);
+          textNode.parentNode?.insertBefore(mentionEl, textNode.nextSibling);
+          mentionEl.after(afterNode);
+          setCaretAfter(mentionEl);
+        } else {
+          const mentionEl = createMention(material);
+          range.insertNode(mentionEl);
+          setCaretAfter(mentionEl);
+        }
+
+        editedText = serializeEditorText();
+        autoSave();
+        hideAutocomplete();
+      };
+
+      const showAutocomplete = (query: string, range: Range) => {
+        const filtered = materials.filter((m) => m.name.toLowerCase().includes(query.toLowerCase()));
+        if (filtered.length === 0) {
+          hideAutocomplete();
+          return;
+        }
+
+        autocompleteDropdown.innerHTML = "";
+        autocompleteSelectedIndex = 0;
+        filtered.forEach((material, index) => {
+          const item = document.createElement("div");
+          item.className = "workspace-autocomplete-item";
+          if (index === 0) item.classList.add("is-selected");
+
+          const name = document.createElement("div");
+          name.className = "workspace-autocomplete-item-name";
+          name.textContent = material.name;
+
+          const summary = document.createElement("div");
+          summary.className = "workspace-autocomplete-item-summary";
+          summary.textContent = material.summary;
+
+          item.append(name, summary);
+          item.addEventListener("mousedown", (e) => {
+            e.preventDefault(); // 防止 editor 失去焦点
+            insertMentionForMaterial(material);
+          });
+          autocompleteDropdown.appendChild(item);
+        });
+
+        positionAutocomplete(range);
+        autocompleteDropdown.style.display = "block";
+        autocompleteVisible = true;
+      };
+
+      const updateAutocompleteSelection = (delta: number) => {
+        const items = autocompleteDropdown.querySelectorAll(".workspace-autocomplete-item");
+        if (items.length === 0) return;
+        items[autocompleteSelectedIndex]?.classList.remove("is-selected");
+        autocompleteSelectedIndex = (autocompleteSelectedIndex + delta + items.length) % items.length;
+        items[autocompleteSelectedIndex]?.classList.add("is-selected");
+        (items[autocompleteSelectedIndex] as HTMLElement)?.scrollIntoView({ block: "nearest" });
+      };
+
+      const maybeTriggerAutocomplete = () => {
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) {
+          hideAutocomplete();
+          return;
+        }
+        const range = sel.getRangeAt(0);
+        if (!range.collapsed || !editor.contains(range.startContainer)) {
+          hideAutocomplete();
+          return;
+        }
+        if (range.startContainer.nodeType !== Node.TEXT_NODE) {
+          hideAutocomplete();
+          return;
+        }
+        const node = range.startContainer as Text;
+        const offset = range.startOffset;
+        const before = node.data.slice(0, offset);
+        const atIndex = before.lastIndexOf("@");
+        if (atIndex < 0) {
+          hideAutocomplete();
+          return;
+        }
+        const query = before.slice(atIndex + 1);
+        if (/[\s]/.test(query)) {
+          hideAutocomplete();
+          return;
+        }
+        mentionQueryNode = node;
+        mentionQueryAtIndex = atIndex;
+        showAutocomplete(query, range);
+      };
+
+      renderEditorFromText(editedText);
+      getCurrentText = () => serializeEditorText();
+
+      editor.addEventListener("input", () => {
+        editedText = serializeEditorText();
+        onEditorStateChange?.({ isEditing: true, title: editedTitle, text: editedText });
+        autoSave();
+        maybeTriggerAutocomplete();
+      });
+
+      editor.addEventListener("keydown", (event) => {
+        if (autocompleteVisible) {
+          if (event.key === "ArrowDown") {
+            event.preventDefault();
+            updateAutocompleteSelection(1);
+            return;
+          }
+          if (event.key === "ArrowUp") {
+            event.preventDefault();
+            updateAutocompleteSelection(-1);
+            return;
+          }
+          if (event.key === "Enter" || event.key === "Tab") {
+            event.preventDefault();
+            const items = autocompleteDropdown.querySelectorAll(".workspace-autocomplete-item");
+            const selectedItem = items[autocompleteSelectedIndex] as HTMLElement | undefined;
+            if (selectedItem) {
+              selectedItem.dispatchEvent(new MouseEvent("mousedown"));
+            }
+            return;
+          }
+          if (event.key === "Escape") {
+            event.preventDefault();
+            hideAutocomplete();
+            return;
+          }
+        }
+      });
+
+      editor.addEventListener("blur", () => {
+        setTimeout(() => hideAutocomplete(), 200);
+      });
+
+      editor.addEventListener("dragover", (event) => {
+        event.preventDefault();
+        editor.classList.add("is-drag-over");
+      });
+
+      editor.addEventListener("dragleave", () => {
+        editor.classList.remove("is-drag-over");
+      });
+
+      editor.addEventListener("drop", async (event) => {
+        event.preventDefault();
+        editor.classList.remove("is-drag-over");
+
+        const files = Array.from(event.dataTransfer?.files || []);
+        if (files.length === 0) return;
+
+        for (const file of files) {
+          try {
+            const arrayBuffer = await file.arrayBuffer();
+            const uint8Array = new Uint8Array(arrayBuffer);
+            const base64 = btoa(String.fromCharCode(...uint8Array));
+
+            const result = await invoke<SavedResource>("import_material", {
+              kind: file.type.startsWith("image/") ? "image" : "file",
+              value: `data:${file.type};base64,${base64}`,
+              name: file.name,
+            });
+
+            if (!result.history_item_id) continue;
+
+            const fallback: SavedResourceSummary = {
+              id: result.history_item_id,
+              kind: result.kind === "image" ? "image" : result.kind === "text" ? "text" : "file",
+              name: result.name,
+              summary: result.summary?.trim() || "暂无概览",
+              size: result.size_bytes ? formatBytes(result.size_bytes) : undefined,
+            };
+            materialsById.set(fallback.id ?? 0, fallback);
+
+            insertMentionForMaterial(fallback);
+            onEditorStateChange?.({ isEditing: true, title: editedTitle, text: serializeEditorText() });
+          } catch (error) {
+            console.error("Failed to import file:", error);
+          }
+        }
+      });
+
+      editorWrap.append(editor, autocompleteDropdown);
+      root.appendChild(editorWrap);
+
+      // 工具栏提示
+      const hint = document.createElement("div");
+      hint.className = "workspace-note-editor-hint";
+      hint.textContent = "使用 @ 引用资源库文件，或拖拽文件到此处 • 自动保存";
+      root.appendChild(hint);
+
+    } else {
+      // 查看模式
+      const content = document.createElement("div");
+      content.className = "workspace-note-detail-content";
+      if (selection.text) {
+        const blocks = selection.text
+          .replace(/\r\n/g, "\n")
+          .split(/\n{2,}/)
+          .map((block) => block.trimEnd());
+
+        for (const block of blocks) {
+          if (!block.trim()) continue;
+          const p = document.createElement("p");
+
+          const lines = block.split("\n");
+          for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+            const line = lines[lineIndex];
+
+            // 解析 @file_id_{id} 并高亮显示
+            const parts = line.split(/(@file_id_\d+)/g);
+            for (const part of parts) {
+              const match = part.match(/^@file_id_(\d+)$/);
+              if (match) {
+                const fileId = parseInt(match[1], 10);
+                const material = allMaterials?.find((m) => m.id === fileId);
+                if (material) {
+                  const mention = document.createElement("span");
+                  mention.className = "workspace-mention";
+                  mention.textContent = `@${material.name}`;
+                  mention.dataset.fileId = String(fileId);
+                  mention.style.cursor = "pointer";
+                  mention.addEventListener("click", () => openMaterialDrawer(material));
+                  p.appendChild(mention);
+                } else {
+                  p.appendChild(document.createTextNode(part));
+                }
+              } else {
+                p.appendChild(document.createTextNode(part));
+              }
+            }
+
+            if (lineIndex < lines.length - 1) {
+              p.appendChild(document.createElement("br"));
+            }
+          }
+
+          content.appendChild(p);
         }
       }
-    });
+      if (!selection.text) {
+        const fallback = document.createElement("p");
+        fallback.textContent = "这条便签暂时没有正文。";
+        content.appendChild(fallback);
+      }
+      root.appendChild(content);
+    }
+
+    if (selection.id && !isEditing) {
+      const footer = document.createElement("div");
+      footer.className = "workspace-detail-actions";
+      const copyButton = document.createElement("button");
+      copyButton.type = "button";
+      copyButton.className = "workspace-action-button";
+      copyButton.textContent = "复制";
+      copyButton.addEventListener("click", () => onCopy?.());
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.className = "workspace-action-button is-danger";
+      deleteButton.textContent = "删除";
+      deleteButton.addEventListener("click", () => onDelete?.());
+      footer.append(copyButton, deleteButton);
+      root.appendChild(footer);
+    }
+
+    // 抽屉（默认关闭；点击 mention 时打开）
+    const { drawer } = ensureDrawer();
+    if (drawerMaterial) {
+      openMaterialDrawer(drawerMaterial);
+    } else {
+      drawer.classList.remove("is-open");
+      drawer.setAttribute("aria-hidden", "true");
+    }
   };
 
-  const selectFilter = (filter: HistoryFilter) => {
-    if (!monitorMode) return; // 非监控模式下不支持切换筛选器
+  render();
+}
 
-    activeFilter = filter;
-    if (filterRoot) renderFilters(filterRoot, activeFilter, selectFilter);
+function renderStaticChat(feedRoot: HTMLElement, toolbarRoot: HTMLElement): void {
+  feedRoot.innerHTML = "";
+  toolbarRoot.innerHTML = "";
 
-    // 切换筛选器时，自动选中该分类下的第一条记录
-    const filtered = history.filter((item) => {
-      if (filter === "all") return true;
-      if (filter === "image") return item.kind === "image";
-      if (filter === "note") return item.kind === "note";
-      return item.kind === "text" || item.kind === "web";
-    }).sort((a, b) => {
-      const aPin = a.pinned ? 1 : 0;
-      const bPin = b.pinned ? 1 : 0;
-      if (aPin !== bPin) return bPin - aPin;
-      if (a.pinned && b.pinned) {
-        return (b.pinned_at_ms ?? 0) - (a.pinned_at_ms ?? 0);
-      }
-      return b.created_at_ms - a.created_at_ms;
-    });
+  const outgoingWrap = document.createElement("div");
+  outgoingWrap.className = "workspace-chat-row is-outgoing";
+  const outgoing = document.createElement("div");
+  outgoing.className = "workspace-chat-bubble is-outgoing";
+  outgoing.textContent = "修复发送区域，工具栏使用图标替代。";
+  outgoingWrap.appendChild(outgoing);
 
-    if (filtered.length > 0 && !filtered.find(item => item.id === activeId)) {
-      // 如果当前选中的不在筛选结果中，自动选中第一条
-      selectItem(filtered[0]);
-    } else {
-      renderHistoryList();
+  const incomingWrap = document.createElement("div");
+  incomingWrap.className = "workspace-chat-row is-incoming";
+  const incoming = document.createElement("div");
+  incoming.className = "workspace-chat-bubble is-incoming";
+  incoming.textContent = "已把发送区域重构为稳定输入面板，并将工具栏从文字标签改成图标按钮，减轻视觉噪音。";
+  incomingWrap.appendChild(incoming);
+
+  feedRoot.append(outgoingWrap, incomingWrap);
+
+  const tools: Array<{ name: WorkspaceIconName; label: string }> = [
+    { name: "paperclip", label: "添加素材" },
+    { name: "sparkles", label: "导入skill" },
+    { name: "plug-zap", label: "连接工具" },
+    { name: "history", label: "历史对话" },
+    { name: "list-todo", label: "查看任务" },
+  ];
+  for (const tool of tools) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "workspace-tool-button";
+    button.setAttribute("aria-label", tool.label);
+    button.title = tool.label;
+    button.appendChild(createWorkspaceIcon(tool.name, "workspace-inline-icon workspace-icon-tool"));
+    toolbarRoot.appendChild(button);
+  }
+}
+
+
+export async function initPreviewView(_root: HTMLElement): Promise<void> {
+  const appWindow = getCurrentWindow();
+  const closeButton = document.getElementById("workspace-close");
+  const searchInput = document.getElementById("workspace-search-input") as HTMLInputElement | null;
+  const navAssets = document.getElementById("workspace-nav-assets");
+  const navNotebook = document.getElementById("workspace-nav-notebook");
+  const navChat = document.getElementById("workspace-nav-chat");
+  const navSettings = document.getElementById("workspace-nav-settings");
+  const pageAssets = document.getElementById("workspace-page-assets");
+  const pageNotebook = document.getElementById("workspace-page-notebook");
+  const pageChat = document.getElementById("workspace-page-chat");
+  const pageSettings = document.getElementById("workspace-page-settings");
+  const assetsFiltersRoot = document.getElementById("workspace-assets-filters");
+  const assetsCount = document.getElementById("workspace-assets-count");
+  const assetsGrid = document.getElementById("workspace-assets-grid");
+  const assetsDetail = document.getElementById("workspace-assets-detail");
+  const notebookCount = document.getElementById("workspace-notebook-count");
+  const notebookList = document.getElementById("workspace-notebook-list");
+  const notebookDetail = document.getElementById("workspace-notebook-detail");
+  const notebookNew = document.getElementById("workspace-notebook-new");
+  const notebookManage = document.getElementById("workspace-notebook-manage");
+  const chatFeed = document.getElementById("workspace-chat-feed");
+  const chatToolbar = document.getElementById("workspace-chat-toolbar");
+  const chatResources = document.getElementById("workspace-chat-resources");
+  const chatSubmit = document.getElementById("workspace-chat-submit");
+
+  let history: ClipboardHistoryItem[] = [];
+  let activePage: WorkspacePage = "assets";
+  let searchQuery = "";
+  let activeAssetFilter: AssetFilter = "all";
+  let selectedAssetId: number | undefined;
+  let selectedNoteId: number | undefined;
+  let notebookManageMode = false;
+  let transientAsset: PanelContentPayload | undefined;
+  let transientNote: PanelContentPayload | undefined;
+  let notebookEditor:
+    | { id: number | null; isEditing: boolean; title: string; text: string; creating?: boolean }
+    | undefined;
+
+  const currentAssets = () => filteredAssets(history, activeAssetFilter, searchQuery);
+  const currentNotes = () => filteredNotes(history, searchQuery);
+  const selectedAssetItem = () => history.find((item) => item.id === selectedAssetId && item.kind !== "note");
+  const selectedNoteItem = () => history.find((item) => item.id === selectedNoteId && item.kind === "note");
+
+  const setPage = (page: WorkspacePage) => {
+    activePage = page;
+    pageAssets?.toggleAttribute("hidden", page !== "assets");
+    pageNotebook?.toggleAttribute("hidden", page !== "notebook");
+    pageChat?.toggleAttribute("hidden", page !== "chat");
+    pageSettings?.toggleAttribute("hidden", page !== "settings");
+    navAssets?.classList.toggle("is-active", page === "assets");
+    navNotebook?.classList.toggle("is-active", page === "notebook");
+    navChat?.classList.toggle("is-active", page === "chat");
+    navSettings?.classList.toggle("is-active", page === "settings");
+    if (searchInput) {
+      searchInput.placeholder = workspacePlaceholder(page);
+      searchInput.value = searchQuery;
     }
+  };
+
+  const selectAsset = (item: ClipboardHistoryItem) => {
+    selectedAssetId = item.id;
+    transientAsset = undefined;
+    safeStore(LAST_ASSET_KEY, String(item.id));
+    setPage("assets");
+    render();
+  };
+
+  const selectNote = (item: ClipboardHistoryItem) => {
+    selectedNoteId = item.id;
+    transientNote = undefined;
+    safeStore(LAST_NOTE_KEY, String(item.id));
+    if (notebookEditor && notebookEditor.id !== item.id) {
+      notebookEditor = undefined;
+    }
+    setPage("notebook");
+    render();
+  };
+
+  const selectDefault = () => {
+    const assetId = Number(safeRead(LAST_ASSET_KEY) || "");
+    const noteId = Number(safeRead(LAST_NOTE_KEY) || "");
+    const assets = assetItems(history);
+    const notes = notebookItems(history);
+    const rememberedAsset = assets.find((item) => item.id === assetId);
+    const rememberedNote = notes.find((item) => item.id === noteId);
+    selectedAssetId = rememberedAsset?.id ?? assets[0]?.id;
+    selectedNoteId = rememberedNote?.id ?? notes[0]?.id;
+    if (selectedAssetId !== undefined) {
+      activePage = "assets";
+    } else if (selectedNoteId !== undefined) {
+      activePage = "notebook";
+    } else {
+      activePage = "chat";
+    }
+  };
+
+  const renderAssetsPage = () => {
+    if (!(assetsGrid instanceof HTMLElement) || !(assetsDetail instanceof HTMLElement)) return;
+    if (assetsFiltersRoot instanceof HTMLElement) {
+      renderAssetFilters(assetsFiltersRoot, activeAssetFilter, (filter) => {
+        activeAssetFilter = filter;
+        render();
+      });
+    }
+
+    const items = currentAssets();
+    if (assetsCount) {
+      assetsCount.textContent = `${items.length} 个素材`;
+    }
+
+    if (!items.find((item) => item.id === selectedAssetId)) {
+      selectedAssetId = items[0]?.id;
+    }
+    renderAssetGrid(assetsGrid, items, selectedAssetId, selectAsset);
+    const selection = selectedAssetItem()
+      ? assetSelectionFromItem(selectedAssetItem()!)
+      : transientAsset
+        ? assetSelectionFromPayload(transientAsset)
+        : undefined;
+    renderAssetDetail(
+      assetsDetail,
+      selection,
+      selection?.id
+        ? () => invoke("toggle_pin_clipboard_history_item", { id: selection.id }).catch(() => {})
+        : undefined,
+      selection?.id
+        ? () => invoke("copy_clipboard_history_item", { id: selection.id }).catch(() => {})
+        : undefined,
+      selection?.id
+        ? () => invoke("delete_clipboard_history_item", { id: selection.id }).catch(() => {})
+        : undefined,
+    );
+  };
+
+  const renderNotebookPage = () => {
+    if (!(notebookList instanceof HTMLElement) || !(notebookDetail instanceof HTMLElement)) return;
+    notebookManage?.classList.toggle("is-active", notebookManageMode);
+    const items = currentNotes();
+    if (notebookCount) notebookCount.textContent = `${items.length} 条便签`;
+    // 新建便签（尚未落库）阶段：不要自动回选列表第一条，否则看起来“+ 没反应”
+    if (notebookEditor?.id === null) {
+      selectedNoteId = undefined;
+    } else if (!items.find((item) => item.id === selectedNoteId)) {
+      selectedNoteId = items[0]?.id;
+    }
+    renderNotebookList(
+      notebookList,
+      items,
+      selectedNoteId,
+      notebookManageMode,
+      selectNote,
+      (item) => invoke("toggle_pin_clipboard_history_item", { id: item.id }).catch(() => {}),
+      (item) => {
+        removeNotebookFromOrder(item.id);
+        invoke("delete_clipboard_history_item", { id: item.id }).catch(() => {});
+      },
+    );
+    const selection = selectedNoteItem()
+      ? noteSelectionFromItem(selectedNoteItem()!)
+      : transientNote
+        ? noteSelectionFromPayload(transientNote)
+        : undefined;
+
+    // 获取所有资源（从history中提取所有素材）
+    const allMaterials: SavedResourceSummary[] = [];
+    for (const item of history) {
+      if (item.kind !== "note") {
+        // 从素材项中提取资源
+        const resource = item.resources?.[0];
+        if (resource) {
+          const summary: SavedResourceSummary = {
+            id: item.id, // 添加 item id
+            kind: resource.kind,
+            name: resource.name,
+            summary: resource.summary || resource.extracted_text || "无描述",
+            size: resource.size_bytes ? formatBytes(resource.size_bytes) : undefined,
+          };
+          if (!allMaterials.find((m) => m.id === summary.id)) {
+            allMaterials.push(summary);
+          }
+        }
+      }
+    }
+
+    renderNotebookDetail(
+      notebookDetail,
+      selection,
+      selection?.id
+        ? () => invoke("toggle_pin_clipboard_history_item", { id: selection.id }).catch(() => {})
+        : undefined,
+      selection?.id
+        ? () => invoke("copy_clipboard_history_item", { id: selection.id }).catch(() => {})
+        : undefined,
+      selection?.id
+        ? () => invoke("delete_clipboard_history_item", { id: selection.id }).catch(() => {})
+        : undefined,
+      selection
+        ? (title: string, text: string) => {
+            const hasAny = Boolean(title.trim() || text.trim());
+            // 没有任何输入内容，不创建（也不保存）
+            if (!hasAny) return;
+
+            if (selection.id) {
+              // 直接保存正文，不再附加资源JSON
+              invoke("update_clipboard_history_item", {
+                id: selection.id,
+                value: text,
+                preview: title || text.split(/\r?\n/)[0] || "无标题",
+              }).catch(() => {});
+              return;
+            }
+
+            // 新建便签：首次有内容时才落库，避免空便签污染列表
+            if (notebookEditor?.creating) return;
+            notebookEditor = {
+              id: null,
+              isEditing: true,
+              title,
+              text,
+              creating: true,
+            };
+            invoke<number | null>("create_note_history_item", { title, value: text })
+              .then((id) => {
+                if (!id) {
+                  if (notebookEditor && notebookEditor.id === null) {
+                    notebookEditor.creating = false;
+                  }
+                  return;
+                }
+                selectedNoteId = id;
+                transientNote = undefined;
+                notebookEditor = { id, isEditing: true, title, text };
+                setPage("notebook");
+                render();
+              })
+              .catch(() => {
+                if (notebookEditor && notebookEditor.id === null) {
+                  notebookEditor.creating = false;
+                }
+              });
+          }
+        : undefined,
+      allMaterials,
+      selection?.id && notebookEditor?.id === selection.id
+        ? notebookEditor
+        : !selection?.id && notebookEditor?.id === null
+          ? notebookEditor
+          : undefined,
+      (next) => {
+        if (selection?.id) {
+          if (next.isEditing) {
+            notebookEditor = { id: selection.id, ...next };
+          } else {
+            notebookEditor = undefined;
+          }
+          return;
+        }
+        // 新建便签（尚未落库）阶段也要保留编辑态缓存
+        if (next.isEditing) {
+          notebookEditor = {
+            id: null,
+            creating: notebookEditor?.creating,
+            ...next,
+          };
+        } else {
+          notebookEditor = undefined;
+        }
+      },
+    );
+  };
+
+  const renderChatPage = () => {
+    if (chatFeed instanceof HTMLElement && chatToolbar instanceof HTMLElement) {
+      renderStaticChat(chatFeed, chatToolbar);
+    }
+    if (chatResources instanceof HTMLElement) {
+      chatResources.innerHTML = "";
+    }
+    if (chatSubmit instanceof HTMLButtonElement) {
+      chatSubmit.disabled = false;
+    }
+  };
+
+  const render = () => {
+    setPage(activePage);
+    renderAssetsPage();
+    renderNotebookPage();
+    renderChatPage();
   };
 
   await invoke("log_debug", {
-    message: `[preview init] label=${appWindow.label}`,
-  }).catch((err) => console.error("[previewView] log_debug failed", err));
+    message: `[workspace init] label=${appWindow.label}`,
+  }).catch(() => {});
 
-  monitorMode = await invoke<boolean>("get_monitor_mode").catch((err) => {
-    console.error("[previewView] get_monitor_mode failed", err);
-    return false;
-  });
-
-  history = await invoke<ClipboardHistoryItem[]>("get_clipboard_history").catch((err) => {
-    console.error("[previewView] get_clipboard_history failed", err);
-    return [];
-  });
-
-  // 非监控模式下，只显示记事本分类
-  if (!monitorMode) {
-    history = history.filter((item) => item.kind === "note");
-    activeFilter = "note";
+  history = await invoke<ClipboardHistoryItem[]>("get_clipboard_history").catch(() => []);
+  selectDefault();
+  if (pageSettings instanceof HTMLElement) {
+    initWorkspaceSettingsPage(pageSettings);
   }
+  render();
 
-  if (filterRoot) {
-    if (monitorMode) {
-      renderFilters(filterRoot, activeFilter, selectFilter);
-    } else {
-      filterRoot.style.display = "none";
-    }
-  }
-
-  // 初始化时尝试恢复上次查看的记录
-  if (history.length > 0) {
-    let itemToSelect: ClipboardHistoryItem | undefined;
-
-    // 1. 尝试加载上次查看的记录
-    try {
-      const lastViewedId = localStorage.getItem(LAST_VIEWED_KEY);
-      if (lastViewedId) {
-        itemToSelect = history.find((item) => item.id === Number(lastViewedId));
-      }
-    } catch {
-      // ignore storage failures
-    }
-
-    // 2. 如果上次查看的记录不存在（被删除或首次打开），选择第一条记录（置顶优先）
-    if (!itemToSelect) {
-      const sorted = [...history].sort((a, b) => {
-        const aPin = a.pinned ? 1 : 0;
-        const bPin = b.pinned ? 1 : 0;
-        if (aPin !== bPin) return bPin - aPin;
-        if (a.pinned && b.pinned) {
-          return (b.pinned_at_ms ?? 0) - (a.pinned_at_ms ?? 0);
-        }
-        return b.created_at_ms - a.created_at_ms;
-      });
-      itemToSelect = sorted[0];
-    }
-
-    selectItem(itemToSelect);
-  } else {
-    renderHistoryList();
-    syncActionButtons();
-  }
-
-  clearBtn?.addEventListener("click", () => {
-    deleteMode = !deleteMode;
-    renderHistoryList();
-    syncActionButtons();
-  });
-
-  pinBtn?.addEventListener("click", () => {
-    if (activeId === undefined) return;
-    invoke("toggle_pin_clipboard_history_item", { id: activeId }).catch((err) =>
-      console.error("[previewView] toggle_pin_clipboard_history_item failed", err),
-    );
-  });
-
-  copyBtn?.addEventListener("click", () => {
-    if (activeId === undefined) return;
-    invoke("copy_clipboard_history_item", { id: activeId }).catch((err) =>
-      console.error("[previewView] copy_clipboard_history_item failed", err),
-    );
-  });
-
-  deleteBtn?.addEventListener("click", () => {
-    if (activeId === undefined) return;
-    const deletingId = activeId;
-    invoke("delete_clipboard_history_item", { id: deletingId })
-      .then(() => {
-        history = history.filter((item) => item.id !== deletingId);
-        activeId = undefined;
-        root.innerHTML = "";
-        renderHistoryList();
-        syncActionButtons();
-      })
-      .catch((err) => console.error("[previewView] delete_clipboard_history_item failed", err));
-  });
-
-  // 关闭按钮
-  const closeBtn = document.getElementById("preview-close");
-  closeBtn?.addEventListener("click", (e) => {
-    e.stopPropagation();
+  closeButton?.addEventListener("click", () => {
     invoke("close_preview").catch(() => {});
   });
-
-  // 点击木板边缘（不点内容区）关闭
-  const previewRoot = document.getElementById("preview-root");
-  previewRoot?.addEventListener("click", (e) => {
-    // 只要点击的是 root（或 close button），说明点在边缘区域
-    if (e.target === previewRoot) {
-      invoke("close_preview").catch(() => {});
-    }
+  navAssets?.addEventListener("click", () => {
+    setPage("assets");
+    render();
+  });
+  navNotebook?.addEventListener("click", () => {
+    setPage("notebook");
+    render();
+  });
+  navChat?.addEventListener("click", () => {
+    setPage("chat");
+    render();
+  });
+  navSettings?.addEventListener("click", () => {
+    setPage("settings");
+    render();
+  });
+  searchInput?.addEventListener("input", () => {
+    searchQuery = searchInput.value.trim();
+    render();
+  });
+  notebookNew?.addEventListener("click", () => {
+    // 新建便签：先进入编辑态；只有真的输入内容后才会落库并出现在列表
+    selectedNoteId = undefined;
+    transientNote = { kind: "note", value: "" };
+    notebookEditor = { id: null, isEditing: true, title: "", text: "" };
+    setPage("notebook");
+    render();
+  });
+  notebookManage?.addEventListener("click", () => {
+    notebookManageMode = !notebookManageMode;
+    render();
   });
 
-  // ESC 关闭预览
-  window.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
       invoke("close_preview").catch(() => {});
     }
   });
 
   await appWindow.listen<PanelContentPayload>("preview-content", (event) => {
-    activeId = event.payload.id;
-    renderContent(root, event.payload.kind, event.payload.value);
-    renderHistoryList();
-    syncActionButtons();
+    const payload = event.payload;
+    if (payload.kind === "note") {
+      const target = history.find((item) => item.id === payload.id && item.kind === "note");
+      if (target) {
+        selectNote(target);
+      } else {
+        selectedNoteId = undefined;
+        transientNote = payload;
+        setPage("notebook");
+        render();
+      }
+      return;
+    }
+    const target = history.find((item) => item.id === payload.id && item.kind !== "note");
+    if (target) {
+      selectAsset(target);
+    } else {
+      selectedAssetId = undefined;
+      transientAsset = payload;
+      setPage("assets");
+      render();
+    }
   });
 
   await appWindow.listen<ClipboardHistoryItem>("history-appended", (event) => {
-    if (!monitorMode && event.payload.kind !== "note") return; // 非监控模式下只接收记事本类型
     history = [...history, event.payload];
-    renderHistoryList();
+    if (event.payload.kind === "note" && selectedNoteId === undefined) {
+      selectedNoteId = event.payload.id;
+    }
+    if (event.payload.kind === "note" && notebookEditor?.id === null) {
+      notebookEditor = { ...notebookEditor, id: event.payload.id, creating: false };
+      transientNote = undefined;
+    }
+    if (event.payload.kind !== "note" && selectedAssetId === undefined) {
+      selectedAssetId = event.payload.id;
+    }
+    render();
   });
 
   await appWindow.listen("history-cleared", () => {
     history = [];
-    activeId = undefined;
-    root.innerHTML = "";
-    renderHistoryList();
-    syncActionButtons();
+    selectedAssetId = undefined;
+    selectedNoteId = undefined;
+    transientAsset = undefined;
+    transientNote = undefined;
+    writeNotebookOrder([]);
+    render();
   });
 
   await appWindow.listen<number>("history-deleted", (event) => {
     history = history.filter((item) => item.id !== event.payload);
-    if (activeId === event.payload) {
-      activeId = undefined;
-      root.innerHTML = "";
-    }
-    renderHistoryList();
-    syncActionButtons();
+    removeNotebookFromOrder(event.payload);
+    if (selectedAssetId === event.payload) selectedAssetId = undefined;
+    if (selectedNoteId === event.payload) selectedNoteId = undefined;
+    render();
   });
 
   await appWindow.listen<ClipboardHistoryItem>("history-pin-toggled", (event) => {
     history = history.map((item) => (item.id === event.payload.id ? event.payload : item));
-    renderHistoryList();
-    syncActionButtons();
+    render();
+  });
+
+  await appWindow.listen<ClipboardHistoryItem>("history-updated", (event) => {
+    history = history.map((item) => (item.id === event.payload.id ? event.payload : item));
+    // 自动保存会触发 history-updated；编辑当前便签时避免重绘详情（会导致退出编辑态/丢光标）
+    if (
+      notebookEditor?.isEditing &&
+      event.payload.kind === "note" &&
+      notebookEditor.id === event.payload.id
+    ) {
+      if (notebookCount) {
+        const items = currentNotes();
+        notebookCount.textContent = `${items.length} 条便签`;
+      }
+      if (notebookList instanceof HTMLElement) {
+        renderNotebookList(
+          notebookList,
+          currentNotes(),
+          selectedNoteId,
+          notebookManageMode,
+          selectNote,
+          (item) => invoke("toggle_pin_clipboard_history_item", { id: item.id }).catch(() => {}),
+          (item) => {
+            removeNotebookFromOrder(item.id);
+            invoke("delete_clipboard_history_item", { id: item.id }).catch(() => {});
+          },
+        );
+      }
+      return;
+    }
+    render();
   });
 }

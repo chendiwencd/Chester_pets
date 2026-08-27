@@ -32,3 +32,18 @@ pub fn apply_monitor_mode(app: &AppHandle, enabled: bool) {
         MonitorModePayload { enabled },
     );
 }
+
+pub fn is_close_on_blur_enabled(app: &AppHandle) -> bool {
+    *app.state::<AppState>().close_on_blur.lock().unwrap()
+}
+
+pub fn apply_close_on_blur(app: &AppHandle, enabled: bool) {
+    {
+        let state = app.state::<AppState>();
+        *state.close_on_blur.lock().unwrap() = enabled;
+    }
+
+    let mut settings = load_settings(app);
+    settings.close_on_blur = enabled;
+    let _ = save_settings(app, &settings);
+}

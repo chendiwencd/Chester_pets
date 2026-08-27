@@ -71,4 +71,4 @@ npm run tauri build
 
 - **开机自启**在 `tauri dev` 下会把“开发时的 exe 路径”写进注册表，正式行为要以打包安装后的版本为准。
 - 全局快捷键 **Ctrl+Shift+V** 常驻注册；若和别的软件冲突，在 `lib.rs` 的 `STORAGE_SHORTCUT` 改。
-- 运行时数据在 `%APPDATA%/com.hbb.desktop-pet/`（位置、历史、设置、images/），清空它相当于重置。
+- 运行时数据在 `%APPDATA%/com.hbb.desktop-pet/`（位置、SQLite 历史、设置、images/、工作目录配置），清空它相当于重置。

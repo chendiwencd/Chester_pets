@@ -4,6 +4,7 @@ import { defineConfig } from "vite";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+const viteHost = host || "127.0.0.1";
 const rootDir = dirname(fileURLToPath(import.meta.url));
 
 // https://vite.dev/config/
@@ -32,14 +33,14 @@ export default defineConfig(async () => ({
   server: {
     // 默认的 1420 端口落在这台机器 Windows 保留的 TCP 排除区间(1338-1437)里，会导致
     // EACCES: permission denied，换成 5173（Vite 默认端口，未被排除）。
-    port: 5173,
+    port: 4173,
     strictPort: true,
-    host: host || false,
+    host: viteHost,
     hmr: host
       ? {
           protocol: "ws",
           host,
-          port: 5174,
+          port: 4174,
         }
       : undefined,
     watch: {

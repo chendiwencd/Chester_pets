@@ -2,12 +2,12 @@ use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::thread;
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
-use crate::state::{images_dir, save_history, AppState, ClipboardHistoryItem, ClipboardSignatures};
+use crate::commands::FileInfoPayload;
+use crate::state::{images_dir, AppState, ClipboardSignatures, SavedResourceInput};
 
 fn preview_text(kind: &'static str, value: &str) -> String {
     if kind == "image" {
@@ -23,63 +23,53 @@ fn preview_text(kind: &'static str, value: &str) -> String {
     }
 }
 
-// value 对 image 是文件路径(.png)，对 text/note 是内联文本内容。
 pub(crate) fn append_history(app: &AppHandle, kind: &'static str, value: String) -> u64 {
-    let state = app.state::<AppState>();
-    {
-        let history = state.clipboard_history.lock().unwrap();
-        if let Some(existing) = history
-            .iter()
-            .find(|item| item.kind == kind && item.value == value)
-        {
-            return existing.id;
-        }
-    }
-
-    let mut seq = state.clipboard_history_seq.lock().unwrap();
-    *seq += 1;
-    let id = *seq;
-    let created_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
-    let mut history = state.clipboard_history.lock().unwrap();
-    history.push(ClipboardHistoryItem {
-        id,
-        kind: kind.to_string(),
-        preview: preview_text(kind, &value),
-        value: value.clone(),
-        created_at_ms,
-        pinned: false,
-        pinned_at_ms: None,
-    });
-    // 到达上限时删最旧的，但跳过置顶项——从最旧一端起找第一个“未置顶”的删除，
-    // 直到回到上限内。如果剩下的全是置顶（没有可删的未置顶项），宁可暂时超过上限也不动置顶内容。
-    const MAX_HISTORY: usize = 100;
-    while history.len() > MAX_HISTORY {
-        match history.iter().position(|item| !item.pinned) {
-            Some(pos) => {
-                history.remove(pos);
-            }
-            None => break,
-        }
-    }
-
-    let snapshot = history.clone();
-    let item = history.last().cloned();
-    drop(history);
-    let _ = save_history(app, &snapshot);
-    if let Some(item) = item {
-        let _ = app.emit_to("preview", "history-appended", item);
-    }
-    id
+    append_history_with_resources(app, kind, value, &[])
 }
 
-// 第三个面板(带输入框)手动输入的内容，作为独立的 "note"(记事本) 类别存入历史，
-// 在存储区里与来自剪贴板的 "text"/"image" 区分显示。
-pub fn append_manual_text_history(app: &AppHandle, value: String) -> u64 {
-    append_history(app, "note", value)
+pub(crate) fn append_history_with_resources(
+    app: &AppHandle,
+    kind: &'static str,
+    value: String,
+    resources: &[SavedResourceInput],
+) -> u64 {
+    let created_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let resources = crate::state::prepare_resource_paths(app, resources);
+
+    let result = crate::db::database_mut(app, |database| {
+        database.insert_history(
+            kind,
+            &value,
+            &preview_text(kind, &value),
+            created_at_ms,
+            &resources,
+        )
+    });
+    let Ok(((item, inserted), history)) = result.and_then(|result| {
+        crate::db::database_mut(app, |database| database.load_history())
+            .map(|history| (result, history))
+    }) else {
+        eprintln!("[db] failed to append history item");
+        return 0;
+    };
+
+    let state = app.state::<AppState>();
+    *state.clipboard_history.lock().unwrap() = history;
+    if inserted {
+        let _ = app.emit_to("preview", "history-appended", item.clone());
+    }
+    item.id
+}
+
+pub fn append_manual_text_history_with_resources(
+    app: &AppHandle,
+    value: String,
+    resources: &[SavedResourceInput],
+) -> u64 {
+    append_history_with_resources(app, "note", value, resources)
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -88,65 +78,138 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn try_forward_image(app: &AppHandle, sig: &mut ClipboardSignatures) -> bool {
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 || value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn image_resource(
+    path: String,
+    name: String,
+    size_bytes: u64,
+    width: u32,
+    height: u32,
+) -> SavedResourceInput {
+    SavedResourceInput {
+        kind: "image".to_string(),
+        name,
+        path: Some(path),
+        summary: None,
+        extracted_text: None,
+        remote_file_id: None,
+        size_bytes: Some(size_bytes),
+        mime_type: Some("image/png".to_string()),
+        extension: Some("png".to_string()),
+        width: Some(width),
+        height: Some(height),
+    }
+}
+
+fn capture_image(
+    app: &AppHandle,
+    sig: &mut ClipboardSignatures,
+    persist: bool,
+) -> Option<FileInfoPayload> {
     let Ok(image) = app.clipboard().read_image() else {
-        return false;
+        return None;
     };
     let width = image.width();
     let height = image.height();
     let rgba = image.rgba().to_vec();
-    let signature = format!("image:{width}x{height}:{}", hash_bytes(&rgba));
-    if sig.image.as_ref() == Some(&signature) {
-        return true;
+    if width == 0 || height == 0 || rgba.is_empty() {
+        return None;
     }
+    let signature = format!("image:{width}x{height}:{}", hash_bytes(&rgba));
 
     let Some(buffer) = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, rgba) else {
-        return false;
+        return None;
     };
 
-    let mut png_bytes: Vec<u8> = Vec::new();
-    let encoded = DynamicImage::ImageRgba8(buffer)
+    let mut png_bytes = Vec::new();
+    if DynamicImage::ImageRgba8(buffer)
         .write_to(&mut std::io::Cursor::new(&mut png_bytes), ImageFormat::Png)
-        .is_ok();
-    if !encoded {
-        return false;
+        .is_err()
+    {
+        return None;
     }
 
-    // 图片以文件形式落盘到 app_data_dir/images/<内容hash>.png，历史里只存文件路径，
-    // 避免把整段 base64 塞进 clipboard_history.json（图片一多 JSON 会膨胀且每次全量重写变慢）。
-    // 用内容 hash 命名：完全相同的图片会得到同一路径，天然完成去重（append_history 按 value 去重）。
-    let Some(dir) = images_dir(app) else {
-        eprintln!("[clipboard] images_dir unavailable, skip image");
-        return false;
+    let Some(directory) = images_dir(app) else {
+        eprintln!("[clipboard] image directory unavailable");
+        return None;
     };
-    let file_name = format!("{}.png", hash_bytes(&png_bytes));
-    let path = dir.join(&file_name);
+    let storage_name = format!("clipboard-image-{}.png", hash_bytes(&png_bytes));
+    let path = directory.join(&storage_name);
     if !path.exists() {
-        if let Err(err) = std::fs::write(&path, &png_bytes) {
-            eprintln!(
-                "[clipboard] failed to write image file {}: {err}",
-                path.display()
-            );
-            return false;
+        if let Err(error) = std::fs::write(&path, &png_bytes) {
+            eprintln!("[clipboard] failed to write image: {error}");
+            return None;
         }
     }
-    let path_str = path.to_string_lossy().to_string();
 
-    append_history(app, "image", path_str);
-    sig.image = Some(signature);
-    true
+    let path_string = path.to_string_lossy().to_string();
+    let created_at_ms = now_ms();
+    let display_name = format!("剪贴板-{created_at_ms}.png");
+    let is_new = sig.image.as_ref() != Some(&signature);
+    let persisted = if persist && is_new {
+        let resource = image_resource(
+            path_string.clone(),
+            display_name.clone(),
+            png_bytes.len() as u64,
+            width,
+            height,
+        );
+        append_history_with_resources(app, "image", path_string.clone(), &[resource]) != 0
+    } else {
+        true
+    };
+    if persisted {
+        sig.image = Some(signature);
+    }
+
+    Some(FileInfoPayload {
+        status: "ready".to_string(),
+        kind: "image".to_string(),
+        name: display_name,
+        size_bytes: Some(png_bytes.len() as u64),
+        mime_type: Some("image/png".to_string()),
+        display_size: format_file_size(png_bytes.len() as u64),
+        overview: String::new(),
+        type_placeholder: String::new(),
+        preview: path_string,
+        file_id: None,
+    })
 }
 
-fn try_forward_text(app: &AppHandle, sig: &mut ClipboardSignatures) {
+fn capture_text(
+    app: &AppHandle,
+    sig: &mut ClipboardSignatures,
+    persist: bool,
+) -> Option<FileInfoPayload> {
     let Ok(text) = app.clipboard().read_text() else {
-        return;
+        return None;
     };
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return;
+        return None;
     }
 
-    // 来自剪贴板的文本/链接都作为 "text" 类别，内联存储。
     let is_web = trimmed.starts_with("http://") || trimmed.starts_with("https://");
     let signature = if is_web {
         format!("web:{trimmed}")
@@ -154,35 +217,51 @@ fn try_forward_text(app: &AppHandle, sig: &mut ClipboardSignatures) {
         format!("text:{trimmed}")
     };
     let already = if is_web { &sig.web } else { &sig.text };
-    if already.as_ref() == Some(&signature) {
-        return;
-    }
-
-    let value = trimmed.to_string();
-    append_history(app, "text", value);
-
-    if is_web {
-        sig.web = Some(signature);
+    let is_new = already.as_ref() != Some(&signature);
+    let persisted = if persist && is_new {
+        append_history(app, "text", trimmed.to_string()) != 0
     } else {
-        sig.text = Some(signature);
+        true
+    };
+    if persisted {
+        if is_web {
+            sig.web = Some(signature);
+        } else {
+            sig.text = Some(signature);
+        }
     }
+
+    let created_at_ms = now_ms();
+    Some(FileInfoPayload {
+        status: "ready".to_string(),
+        kind: "text".to_string(),
+        name: format!("剪贴板-{created_at_ms}.txt"),
+        size_bytes: Some(trimmed.as_bytes().len() as u64),
+        mime_type: Some("text/plain".to_string()),
+        display_size: format_file_size(trimmed.as_bytes().len() as u64),
+        overview: String::new(),
+        type_placeholder: String::new(),
+        preview: trimmed.to_string(),
+        file_id: None,
+    })
 }
 
-// 面板打开期间由前端定时轮询，只同步“最新的一条”剪贴板内容，不抢系统 Ctrl+V。
-pub fn forward_latest_clipboard(app: &AppHandle, sig: &mut ClipboardSignatures) {
-    if try_forward_image(app, sig) {
-        return;
-    }
-    try_forward_text(app, sig);
+pub fn capture_latest_clipboard(
+    app: &AppHandle,
+    sig: &mut ClipboardSignatures,
+    persist: bool,
+) -> Option<FileInfoPayload> {
+    capture_image(app, sig, persist).or_else(|| capture_text(app, sig, persist))
 }
 
 pub fn spawn_clipboard_monitor(app: AppHandle) {
     thread::spawn(move || {
-        let mut signatures = ClipboardSignatures::default();
         loop {
             let monitor_enabled = *app.state::<AppState>().monitor_mode.lock().unwrap();
             if monitor_enabled {
-                forward_latest_clipboard(&app, &mut signatures);
+                let state = app.state::<AppState>();
+                let mut signatures = state.clipboard_signatures.lock().unwrap();
+                let _ = capture_latest_clipboard(&app, &mut signatures, true);
             }
             thread::sleep(Duration::from_millis(450));
         }

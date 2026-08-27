@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
-use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
 use serde_json::json;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::image::Image;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -8,7 +8,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 
 use crate::state::{
-    images_dir, save_history, save_position, AppState, ClipboardHistoryItem, PetPosition,
+    images_dir, save_position, AppState, ClipboardHistoryItem, PetPosition, SavedResourceInput,
 };
 use crate::windows::{position_image_viewer, position_preview, PanelKind, ScreenRect};
 use crate::{settings, windows};
@@ -33,6 +33,10 @@ pub fn log_debug(message: String) {
     println!("{message}");
 }
 
+pub fn reset_input_panel(app: &AppHandle) {
+    let _ = app.emit_to("panel-web", "input-panel-reset", ());
+}
+
 #[tauri::command]
 pub fn set_panel_visibility(app: AppHandle, state: State<AppState>, open: bool) -> bool {
     {
@@ -43,6 +47,7 @@ pub fn set_panel_visibility(app: AppHandle, state: State<AppState>, open: bool) 
         let mut sig = state.clipboard_signatures.lock().unwrap();
         *sig = crate::state::ClipboardSignatures::default();
     }
+    reset_input_panel(&app);
     println!("[panel visibility] requested open={open}");
 
     let Some(main_window) = app.get_webview_window("main") else {
@@ -122,18 +127,6 @@ pub fn resize_input_panel(app: AppHandle, height: f64) {
 }
 
 #[tauri::command]
-pub fn poll_clipboard(app: AppHandle, state: State<AppState>) {
-    let panel_open = *state.panel_open.lock().unwrap();
-    let monitor_mode = *state.monitor_mode.lock().unwrap();
-    if !panel_open || monitor_mode {
-        return;
-    }
-
-    let mut sig = state.clipboard_signatures.lock().unwrap();
-    crate::clipboard::forward_latest_clipboard(&app, &mut sig);
-}
-
-#[tauri::command]
 pub fn get_monitor_mode(state: State<AppState>) -> bool {
     *state.monitor_mode.lock().unwrap()
 }
@@ -145,8 +138,47 @@ pub fn set_monitor_mode(app: AppHandle, enabled: bool) -> bool {
 }
 
 #[tauri::command]
+pub fn get_close_on_blur(app: AppHandle) -> bool {
+    settings::is_close_on_blur_enabled(&app)
+}
+
+#[tauri::command]
+pub fn set_close_on_blur(app: AppHandle, enabled: bool) -> bool {
+    settings::apply_close_on_blur(&app, enabled);
+    enabled
+}
+
+#[tauri::command]
 pub fn get_shortcut_settings(state: State<AppState>) -> crate::state::ShortcutSettings {
     state.shortcuts.lock().unwrap().clone()
+}
+
+#[tauri::command]
+pub fn get_workspace_directory(state: State<AppState>) -> String {
+    state
+        .workspace_dir
+        .lock()
+        .unwrap()
+        .to_string_lossy()
+        .to_string()
+}
+
+#[tauri::command]
+pub fn set_workspace_directory(
+    app: AppHandle,
+    state: State<AppState>,
+    directory: String,
+) -> Result<String, String> {
+    let directory = directory.trim();
+    let resolved = crate::state::resolve_workspace_dir(&app, directory)?;
+
+    let mut settings = crate::state::load_settings(&app);
+    settings.workspace_dir = directory.to_string();
+    crate::state::save_settings(&app, &settings)
+        .map_err(|err| format!("工作目录设置保存失败：{err}"))?;
+
+    *state.workspace_dir.lock().unwrap() = resolved.clone();
+    Ok(resolved.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -293,13 +325,22 @@ struct ScreenshotResultPayload {
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct FileInfoPayload {
     #[serde(default)]
-    kind: String,
-    name: String,
-    size_bytes: Option<u64>,
-    display_size: String,
-    type_placeholder: String,
+    pub(crate) status: String,
     #[serde(default)]
-    preview: String,
+    pub(crate) kind: String,
+    pub(crate) name: String,
+    pub(crate) size_bytes: Option<u64>,
+    #[serde(default)]
+    pub(crate) mime_type: Option<String>,
+    pub(crate) display_size: String,
+    #[serde(default)]
+    pub(crate) overview: String,
+    #[serde(default)]
+    pub(crate) type_placeholder: String,
+    #[serde(default)]
+    pub(crate) preview: String,
+    #[serde(default)]
+    pub(crate) file_id: Option<String>,
 }
 
 fn format_file_size(bytes: u64) -> String {
@@ -315,6 +356,15 @@ fn format_file_size(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn capture_screenshot_data_url(rect: &ScreenshotSelectionRect) -> Option<String> {
@@ -374,30 +424,81 @@ pub fn show_file_info_payload(app: &AppHandle, payload: FileInfoPayload) {
     let _ = app.emit_to("panel-web", "input-panel-content", payload);
 }
 
-pub fn show_file_info_for_path(app: &AppHandle, path: &std::path::Path) {
+pub fn show_file_info_for_path_with_summary(
+    app: &AppHandle,
+    path: &Path,
+    overview: Option<String>,
+    extracted_text: Option<String>,
+    remote_file_id: Option<String>,
+) -> Option<FileInfoPayload> {
+    let stored_path = match crate::state::copy_file_to_workspace(app, path) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("[workspace] {err}");
+            path.to_path_buf()
+        }
+    };
+    let kind = classify_path_kind(path);
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| path.display().to_string());
-    let size_bytes = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+    let size_bytes = std::fs::metadata(&stored_path)
+        .ok()
+        .map(|metadata| metadata.len());
     let display_size = size_bytes
         .map(format_file_size)
         .unwrap_or_else(|| "0 B".to_string());
-    show_file_info_payload(
+    let stored_value = stored_path.to_string_lossy().to_string();
+    let mime_type = guess_mime_type(path);
+    let overview = overview.unwrap_or_default().trim().to_string();
+    let extracted_text = extracted_text.unwrap_or_default();
+    let extracted_text = (!extracted_text.trim().is_empty()).then_some(extracted_text);
+    let remote_file_id = remote_file_id.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then_some(value.to_string())
+    });
+    let resource = SavedResourceInput {
+        kind: kind.to_string(),
+        name: name.clone(),
+        path: Some(stored_value.clone()),
+        summary: (!overview.is_empty()).then_some(overview.clone()),
+        extracted_text: extracted_text.clone(),
+        remote_file_id: remote_file_id.clone(),
+        size_bytes,
+        mime_type: mime_type.clone(),
+        extension: path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase()),
+        width: None,
+        height: None,
+    };
+    let _ = crate::clipboard::append_history_with_resources(
         app,
-        FileInfoPayload {
-            kind: classify_path_kind(path).to_string(),
-            name,
-            size_bytes,
-            display_size,
-            type_placeholder: path.display().to_string(),
-            preview: path.display().to_string(),
-        },
+        kind,
+        stored_value.clone(),
+        &[resource],
     );
+
+    let payload = FileInfoPayload {
+        status: "ready".to_string(),
+        kind: kind.to_string(),
+        name,
+        size_bytes,
+        mime_type,
+        display_size,
+        overview,
+        type_placeholder: String::new(),
+        preview: stored_value,
+        file_id: remote_file_id,
+    };
+    show_file_info_payload(app, payload.clone());
+    Some(payload)
 }
 
-fn classify_path_kind(path: &std::path::Path) -> &'static str {
+fn classify_path_kind(path: &Path) -> &'static str {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -409,79 +510,117 @@ fn classify_path_kind(path: &std::path::Path) -> &'static str {
     }
 }
 
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn clipboard_image_payload(app: &AppHandle) -> Option<FileInfoPayload> {
-    let image = app.clipboard().read_image().ok()?;
-    let width = image.width();
-    let height = image.height();
-    let rgba = image.rgba().to_vec();
-    let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, rgba)?;
-
-    let mut png_bytes: Vec<u8> = Vec::new();
-    DynamicImage::ImageRgba8(buffer)
-        .write_to(&mut std::io::Cursor::new(&mut png_bytes), ImageFormat::Png)
-        .ok()?;
-
-    let dir = images_dir(app)?;
-    let file_name = format!("{}.png", hash_bytes(&png_bytes));
-    let path = dir.join(file_name);
-    if !path.exists() {
-        std::fs::write(&path, &png_bytes).ok()?;
-    }
-
-    let value = path.to_string_lossy().to_string();
-    crate::clipboard::append_history(app, "image", value.clone());
-
-    Some(FileInfoPayload {
-        kind: "image".to_string(),
-        name: path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "clipboard.png".to_string()),
-        size_bytes: Some(png_bytes.len() as u64),
-        display_size: format_file_size(png_bytes.len() as u64),
-        type_placeholder: value.clone(),
-        preview: value,
-    })
-}
-
-fn clipboard_text_payload(app: &AppHandle) -> Option<FileInfoPayload> {
-    let text = app.clipboard().read_text().ok()?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let value = trimmed.to_string();
-    crate::clipboard::append_history(app, "text", value.clone());
-
-    Some(FileInfoPayload {
-        kind: "text".to_string(),
-        name: "剪贴板文本".to_string(),
-        size_bytes: Some(value.len() as u64),
-        display_size: format_file_size(value.len() as u64),
-        type_placeholder: "文本资源".to_string(),
-        preview: value,
-    })
+fn guess_mime_type(path: &Path) -> Option<String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mime = match extension.as_str() {
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "gif" => "image/gif",
+        "heic" => "image/heic",
+        "jpeg" | "jpg" => "image/jpeg",
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "pdf" => "application/pdf",
+        "txt" | "md" => "text/plain",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => return None,
+    };
+    Some(mime.to_string())
 }
 
 #[tauri::command]
-pub fn paste_clipboard_to_input_panel(app: AppHandle, state: State<AppState>) -> Option<FileInfoPayload> {
+pub fn paste_clipboard_to_input_panel(
+    app: AppHandle,
+    state: State<AppState>,
+) -> Option<FileInfoPayload> {
     if !*state.panel_open.lock().unwrap() {
         return None;
     }
 
-    let payload = clipboard_image_payload(&app).or_else(|| clipboard_text_payload(&app))?;
-    let _ = app.emit_to("panel-web", "input-panel-content", payload.clone());
+    let mut signatures = state.clipboard_signatures.lock().unwrap();
+    let payload = crate::clipboard::capture_latest_clipboard(&app, &mut signatures, false)?;
+    if payload.kind == "text" {
+        let _ = crate::clipboard::append_history(&app, "text", payload.preview.clone());
+    }
+    // 文件和图片类型已在后端自动保存到素材区，不需要前端显示确认界面
+    // 只有通过拖拽且没有路径的情况才需要前端确认
+    // 这里剪贴板捕获的内容已经完成导入，不发送事件
     Some(payload)
+}
+
+#[tauri::command]
+pub fn save_file_to_material(
+    app: AppHandle,
+    path: String,
+    overview: Option<String>,
+    extracted_text: Option<String>,
+    remote_file_id: Option<String>,
+) -> Option<FileInfoPayload> {
+    let path = Path::new(path.trim());
+    if !path.is_file() {
+        eprintln!("[workspace] dropped path is not a file: {}", path.display());
+        return None;
+    }
+    show_file_info_for_path_with_summary(&app, path, overview, extracted_text, remote_file_id)
+}
+
+#[tauri::command]
+pub fn read_file_data_url(value: String) -> Option<String> {
+    if value.starts_with("data:") {
+        return Some(value);
+    }
+    let path = Path::new(value.trim());
+    let bytes = std::fs::read(path).ok()?;
+    let mime_type = guess_mime_type(path).unwrap_or_else(|| "application/octet-stream".to_string());
+    Some(format!("data:{mime_type};base64,{}", STANDARD.encode(bytes)))
+}
+
+#[tauri::command]
+pub fn save_file_data_url_to_material(
+    app: AppHandle,
+    name: String,
+    mime_type: Option<String>,
+    data_url: String,
+    overview: Option<String>,
+    extracted_text: Option<String>,
+    remote_file_id: Option<String>,
+) -> Option<FileInfoPayload> {
+    let (_, encoded) = data_url.split_once(',')?;
+    let bytes = STANDARD.decode(encoded.trim()).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let temp_dir = app.path().temp_dir().ok()?.join(format!(
+        "desktop-shell-import-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_nanos(),
+    ));
+    std::fs::create_dir_all(&temp_dir).ok()?;
+    let file_name = Path::new(name.trim())
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("document");
+    let temp_path = temp_dir.join(file_name);
+    std::fs::write(&temp_path, bytes).ok()?;
+    let mut payload = show_file_info_for_path_with_summary(
+        &app,
+        &temp_path,
+        overview,
+        extracted_text,
+        remote_file_id,
+    );
+    let _ = std::fs::remove_dir_all(temp_dir);
+    if let (Some(payload), Some(mime_type)) = (payload.as_mut(), mime_type) {
+        payload.mime_type = Some(mime_type);
+    }
+    payload
 }
 
 #[tauri::command]
@@ -497,6 +636,7 @@ pub fn open_preview(
         let mut panel_open = state.panel_open.lock().unwrap();
         *panel_open = false;
     }
+    reset_input_panel(&app);
     for label in ["panel-web"] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.hide();
@@ -541,6 +681,7 @@ pub fn open_storage_impl(app: &AppHandle) {
         let mut panel_open = state.panel_open.lock().unwrap();
         *panel_open = false;
     }
+    reset_input_panel(&app);
     for label in ["panel-web"] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.hide();
@@ -566,31 +707,26 @@ pub fn open_storage_impl(app: &AppHandle) {
     let _ = preview.show();
     let _ = preview.set_focus();
 
-    let monitor_mode = *state.monitor_mode.lock().unwrap();
-    if monitor_mode {
-        let latest = {
-            let history = state.clipboard_history.lock().unwrap();
-            history.last().cloned()
-        };
-        println!(
-            "[open_storage] monitor_mode=true, shown, preselect={}",
-            latest
-                .as_ref()
-                .map_or("none".to_string(), |item| item.id.to_string())
+    let latest = {
+        let history = state.clipboard_history.lock().unwrap();
+        history.last().cloned()
+    };
+    println!(
+        "[open_storage] shown, preselect={}",
+        latest
+            .as_ref()
+            .map_or("none".to_string(), |item| item.id.to_string())
+    );
+    if let Some(item) = latest {
+        let _ = app.emit_to(
+            "preview",
+            "preview-content",
+            PreviewPayload {
+                id: Some(item.id),
+                kind: item.kind,
+                value: item.value,
+            },
         );
-        if let Some(item) = latest {
-            let _ = app.emit_to(
-                "preview",
-                "preview-content",
-                PreviewPayload {
-                    id: Some(item.id),
-                    kind: item.kind,
-                    value: item.value,
-                },
-            );
-        }
-    } else {
-        println!("[open_storage] monitor_mode=false, skip preselect from clipboard");
     }
 
     let _ = app.emit_to("main", "preview-state", PreviewStatePayload { open: true });
@@ -649,26 +785,35 @@ pub fn open_original_image(app: AppHandle, value: String) {
 }
 
 #[tauri::command]
-pub fn get_clipboard_history(state: State<AppState>) -> Vec<ClipboardHistoryItem> {
+pub fn get_clipboard_history(app: AppHandle, state: State<AppState>) -> Vec<ClipboardHistoryItem> {
+    if let Ok(history) = crate::db::database_mut(&app, |database| database.load_history()) {
+        *state.clipboard_history.lock().unwrap() = history.clone();
+        return history;
+    }
     state.clipboard_history.lock().unwrap().clone()
 }
 
 #[tauri::command]
 pub fn clear_clipboard_history(app: AppHandle, state: State<AppState>) {
+    let _ = crate::db::database_mut(&app, |database| database.clear_history());
     state.clipboard_history.lock().unwrap().clear();
     *state.clipboard_signatures.lock().unwrap() = crate::state::ClipboardSignatures::default();
-    let _ = save_history(&app, &[]);
     let _ = app.emit_to("preview", "history-cleared", ());
 }
 
 #[tauri::command]
 pub fn delete_clipboard_history_item(app: AppHandle, state: State<AppState>, id: u64) {
-    let mut history = state.clipboard_history.lock().unwrap();
-    history.retain(|item| item.id != id);
-    let snapshot = history.clone();
-    drop(history);
-    let _ = save_history(&app, &snapshot);
-    let _ = app.emit_to("preview", "history-deleted", id);
+    let Ok(deleted) = crate::db::database_mut(&app, |database| database.delete_history(id)) else {
+        return;
+    };
+    if deleted {
+        state
+            .clipboard_history
+            .lock()
+            .unwrap()
+            .retain(|item| item.id != id);
+        let _ = app.emit_to("preview", "history-deleted", id);
+    }
 }
 
 #[tauri::command]
@@ -724,13 +869,83 @@ pub fn read_image_data_url(value: String) -> Option<String> {
 }
 
 #[tauri::command]
-pub fn add_text_history_item(app: AppHandle, value: String) -> Option<u64> {
+pub fn add_text_history_item(
+    app: AppHandle,
+    value: String,
+    resources: Option<Vec<SavedResourceInput>>,
+) -> Option<u64> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let id = crate::clipboard::append_manual_text_history(&app, trimmed.to_string());
+    let resources = resources.unwrap_or_default();
+    let id = crate::clipboard::append_manual_text_history_with_resources(
+        &app,
+        trimmed.to_string(),
+        &resources,
+    );
     Some(id)
+}
+
+#[tauri::command]
+pub fn create_note_history_item(
+    app: AppHandle,
+    state: State<AppState>,
+    title: String,
+    value: String,
+) -> Option<u64> {
+    let title = title.trim().to_string();
+    let has_title = !title.is_empty();
+    let has_value = !value.trim().is_empty();
+    if !has_title && !has_value {
+        return None;
+    }
+
+    let preview = if has_title {
+        title
+    } else {
+        // 标题为空时，回退为正文首行（截断）
+        let single_line = value
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .replace('\n', " ");
+        let mut chars = single_line.chars();
+        let preview: String = chars.by_ref().take(28).collect();
+        if chars.next().is_some() {
+            format!("{preview}…")
+        } else {
+            preview
+        }
+    };
+
+    let created_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+
+    let normalized_value = if has_value {
+        value.trim_end().to_string()
+    } else {
+        "".to_string()
+    };
+
+    let result = crate::db::database_mut(&app, |database| {
+        database.insert_history("note", &normalized_value, &preview, created_at_ms, &[])
+    });
+    let Ok(((item, inserted), history)) = result.and_then(|result| {
+        crate::db::database_mut(&app, |database| database.load_history()).map(|history| (result, history))
+    }) else {
+        eprintln!("[db] failed to append note history item");
+        return None;
+    };
+
+    *state.clipboard_history.lock().unwrap() = history;
+    if inserted {
+        let _ = app.emit_to("preview", "history-appended", item.clone());
+    }
+    Some(item.id)
 }
 
 #[tauri::command]
@@ -758,19 +973,28 @@ pub fn save_screenshot_note(
     let file_name = format!("screenshot-{}.png", hash_bytes(&png_bytes));
     let path = dir.join(&file_name);
     if !path.exists() {
-        std::fs::write(&path, &png_bytes)
-            .map_err(|err| format!("图片保存失败：{err}"))?;
+        std::fs::write(&path, &png_bytes).map_err(|err| format!("图片保存失败：{err}"))?;
     }
 
     let path_string = path.to_string_lossy().to_string();
-    let summary = ocr_text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let summary = ocr_text.split_whitespace().collect::<Vec<_>>().join(" ");
     let summary = if summary.is_empty() {
         "截图".to_string()
     } else {
         summary.chars().take(120).collect()
+    };
+    let resource_input = SavedResourceInput {
+        kind: "image".to_string(),
+        name: file_name.clone(),
+        path: Some(path_string.clone()),
+        summary: Some(summary.clone()),
+        extracted_text: None,
+        remote_file_id: None,
+        size_bytes: Some(png_bytes.len() as u64),
+        mime_type: Some("image/png".to_string()),
+        extension: Some("png".to_string()),
+        width: None,
+        height: None,
     };
     let resources = json!([{
         "kind": "image",
@@ -785,13 +1009,11 @@ pub fn save_screenshot_note(
     if !trimmed_ocr.is_empty() {
         sections.push(trimmed_ocr.to_string());
     }
-    sections.push(format!(
-        "[[desktop-shell:resources:v1]]\n{}",
-        resources
-    ));
-    Ok(crate::clipboard::append_manual_text_history(
+    sections.push(format!("[[desktop-shell:resources:v1]]\n{}", resources));
+    Ok(crate::clipboard::append_manual_text_history_with_resources(
         &app,
         sections.join("\n\n"),
+        &[resource_input],
     ))
 }
 
@@ -802,22 +1024,50 @@ pub fn toggle_pin_clipboard_history_item(app: AppHandle, state: State<AppState>,
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let updated = {
-        let mut history = state.clipboard_history.lock().unwrap();
-        let Some(index) = history.iter().position(|item| item.id == id) else {
-            return;
-        };
-        let item = &mut history[index];
-        item.pinned = !item.pinned;
-        item.pinned_at_ms = if item.pinned { Some(now_ms) } else { None };
-        let updated = item.clone();
-        let snapshot = history.clone();
-        drop(history);
-        let _ = save_history(&app, &snapshot);
-        updated
+    let Ok(Some(updated)) =
+        crate::db::database_mut(&app, |database| database.toggle_pin(id, now_ms))
+    else {
+        return;
     };
 
+    if let Some(item) = state
+        .clipboard_history
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item.id == id)
+    {
+        *item = updated.clone();
+    }
+
     let _ = app.emit_to("preview", "history-pin-toggled", updated);
+}
+
+#[tauri::command]
+pub fn update_clipboard_history_item(
+    app: AppHandle,
+    state: State<AppState>,
+    id: u64,
+    value: String,
+    preview: String,
+) {
+    let Ok(Some(updated)) =
+        crate::db::database_mut(&app, |database| database.update_history_item(id, &value, &preview))
+    else {
+        return;
+    };
+
+    if let Some(item) = state
+        .clipboard_history
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item.id == id)
+    {
+        *item = updated.clone();
+    }
+
+    let _ = app.emit_to("preview", "history-updated", updated);
 }
 
 #[tauri::command]
@@ -897,8 +1147,14 @@ pub fn show_file_info(app: AppHandle, payload: FileInfoPayload) {
     show_file_info_payload(&app, payload);
 }
 
+#[tauri::command]
+pub fn complete_file_explanation(app: AppHandle) {
+    let _ = app.emit_to("main", "file-explanation-complete", ());
+}
+
 // 供 lib.rs 在“应用整体失焦”时调用：一把梭隐藏所有面板/预览窗口
 pub fn hide_all_overlays(app: &AppHandle) {
+    reset_input_panel(app);
     for label in ["panel-web", "preview", "screenshot-selector"] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.hide();
