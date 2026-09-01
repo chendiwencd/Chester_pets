@@ -15,6 +15,8 @@ import type {
   TranslationRequest,
   TranslationResponse,
   FileReaderResponse,
+  TextUploadRequest,
+  TextUploadResponse,
 } from "./types";
 
 export type { FileReaderResponse } from "./types";
@@ -35,6 +37,7 @@ function formatApiError(payload: unknown, fallback: string): string {
 
 export class ApiClient {
   private baseURL: string;
+  private refreshPromise: Promise<boolean> | null = null;
 
   constructor(baseURL: string = "http://127.0.0.1:5000") {
     this.baseURL = baseURL;
@@ -45,6 +48,69 @@ export class ApiClient {
     return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
+  private saveAuthResponseToStorage(response: AuthResponse): void {
+    localStorage.setItem("user", JSON.stringify(response.user));
+    localStorage.setItem("access_token", response.tokens.access_token);
+    localStorage.setItem("refresh_token", response.tokens.refresh_token);
+    localStorage.setItem("session_id", response.session.id);
+  }
+
+  private async refreshAccessToken(): Promise<boolean> {
+    const refreshToken = localStorage.getItem("refresh_token");
+    if (!refreshToken) return false;
+
+    try {
+      const response = await fetch(`${this.baseURL}/api/v1/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+      if (!response.ok) {
+        return false;
+      }
+      const payload = (await response.json()) as AuthResponse;
+      this.saveAuthResponseToStorage(payload);
+      window.dispatchEvent(new CustomEvent("auth-refreshed"));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async ensureFreshToken(): Promise<boolean> {
+    if (!this.refreshPromise) {
+      this.refreshPromise = this.refreshAccessToken().finally(() => {
+        this.refreshPromise = null;
+      });
+    }
+    return this.refreshPromise;
+  }
+
+  private async fetchWithAuthRetry(
+    url: string,
+    options: RequestInit,
+    allowRetry: boolean,
+  ): Promise<Response> {
+    const attempt = async () => {
+      const headers = {
+        ...this.getAuthHeader(),
+        ...options.headers,
+      } as HeadersInit;
+      return fetch(url, { ...options, headers });
+    };
+
+    const response = await attempt();
+    if (response.status !== 401 || !allowRetry) return response;
+
+    const refreshed = await this.ensureFreshToken();
+    if (!refreshed) {
+      window.dispatchEvent(new CustomEvent("auth-expired"));
+      return response;
+    }
+
+    return attempt();
+  }
+
   private async request<T>(
     path: string,
     options: RequestInit = {},
@@ -52,11 +118,10 @@ export class ApiClient {
     const url = `${this.baseURL}${path}`;
     const headers = {
       "Content-Type": "application/json",
-      ...this.getAuthHeader(),
       ...options.headers,
     };
 
-    const response = await fetch(url, { ...options, headers });
+    const response = await this.fetchWithAuthRetry(url, { ...options, headers }, true);
 
     if (!response.ok) {
       let payload: unknown;
@@ -64,6 +129,9 @@ export class ApiClient {
         payload = await response.json();
       } catch {
         payload = undefined;
+      }
+      if (response.status === 401) {
+        throw new Error("登录已失效，请重新登录");
       }
       const error = { detail: formatApiError(payload, `HTTP ${response.status}`) };
       throw new Error(error.detail || "请求失败");
@@ -140,6 +208,13 @@ export class ApiClient {
     });
   }
 
+  async textUpload(data: TextUploadRequest): Promise<TextUploadResponse> {
+    return this.request<TextUploadResponse>("/api/v1/tools/text_upload", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
   async fileReader(
     file: Blob,
     fileName: string,
@@ -153,11 +228,12 @@ export class ApiClient {
       : file;
     form.append("file", upload, fileName);
 
-    const response = await fetch(`${this.baseURL}/api/v1/tools/file_reader`, {
+    const response = await this.fetchWithAuthRetry(`${this.baseURL}/api/v1/tools/file_reader`, {
       method: "POST",
-      headers: this.getAuthHeader(),
       body: form,
-    });
+      // FormData 不要设置 Content-Type（浏览器会自动带 boundary）
+      headers: this.getAuthHeader(),
+    }, true);
 
     if (!response.ok) {
       let payload: unknown;
@@ -165,6 +241,9 @@ export class ApiClient {
         payload = await response.json();
       } catch {
         payload = undefined;
+      }
+      if (response.status === 401) {
+        throw new Error("登录已失效，请重新登录");
       }
       const error = { detail: formatApiError(payload, `HTTP ${response.status}`) };
       throw new Error(error.detail || "文件读取失败");

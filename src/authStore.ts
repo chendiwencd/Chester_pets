@@ -26,6 +26,15 @@ class AuthStore {
 
   constructor() {
     this.loadFromStorage();
+    window.addEventListener("auth-expired", () => {
+      // token/refresh 失效：强制回到未登录态，让 UI 进入登录流程
+      this.clearAuth();
+    });
+    window.addEventListener("auth-refreshed", () => {
+      // 其他窗口触发 refresh 后，同步本窗口的 auth 状态
+      this.loadFromStorage();
+      this.notify();
+    });
   }
 
   private notify(): void {

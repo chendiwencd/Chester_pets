@@ -45,6 +45,8 @@ pub(crate) fn append_history_with_resources(
             &value,
             &preview_text(kind, &value),
             created_at_ms,
+            Some("not_uploaded"),
+            None,
             &resources,
         )
     });

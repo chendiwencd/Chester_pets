@@ -1,4 +1,4 @@
-export type PetStatus = "waiting" | "open" | "moving" | "sleep" | "waitting_file";
+export type PetStatus = "waiting" | "open" | "moving" | "sleep" | "waitting_file" | "happy";
 export type MovingDirection = "left" | "right";
 
 export const STATUS_TEXT: Record<PetStatus, string> = {
@@ -7,6 +7,7 @@ export const STATUS_TEXT: Record<PetStatus, string> = {
   moving: "移动",
   sleep: "休眠",
   waitting_file: "等待文件",
+  happy: "开心",
 };
 
 type Listener = (status: PetStatus) => void;

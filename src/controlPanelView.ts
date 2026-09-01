@@ -552,6 +552,75 @@ function renderPetSection(content: HTMLElement): void {
   content.append(title, card);
 }
 
+function createNumberRow(
+  title: string,
+  description: string,
+  initial: number,
+  onSave: (value: number) => Promise<number>,
+  options: { min: number; max: number; step?: number } = { min: 1, max: 500, step: 1 },
+): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "control-panel-setting-row";
+
+  const textWrap = document.createElement("div");
+  textWrap.className = "control-panel-setting-copy";
+  const heading = document.createElement("div");
+  heading.className = "control-panel-setting-title";
+  heading.textContent = title;
+  const desc = document.createElement("div");
+  desc.className = "control-panel-setting-desc";
+  desc.textContent = description;
+  textWrap.append(heading, desc);
+
+  const controls = document.createElement("div");
+  controls.className = "control-panel-workspace-controls";
+
+  const input = document.createElement("input");
+  input.type = "number";
+  input.className = "control-panel-workspace-input";
+  input.min = String(options.min);
+  input.max = String(options.max);
+  input.step = String(options.step ?? 1);
+  input.value = String(initial);
+
+  const saveButton = document.createElement("button");
+  saveButton.type = "button";
+  saveButton.className = "control-panel-secondary-button";
+  saveButton.textContent = "保存";
+
+  const status = document.createElement("span");
+  status.className = "control-panel-workspace-status";
+  status.setAttribute("role", "status");
+
+  let current = initial;
+  const sync = () => {
+    const next = Number(input.value);
+    const valid = Number.isFinite(next) && next >= options.min && next <= options.max;
+    saveButton.disabled = !valid || next === current;
+  };
+  sync();
+  input.addEventListener("input", sync);
+
+  saveButton.addEventListener("click", async () => {
+    saveButton.disabled = true;
+    status.textContent = "保存中...";
+    try {
+      const next = await onSave(Number(input.value));
+      current = next;
+      input.value = String(next);
+      status.textContent = "已生效";
+    } catch (err) {
+      status.textContent = err instanceof Error ? err.message : String(err);
+    } finally {
+      sync();
+    }
+  });
+
+  controls.append(input, saveButton, status);
+  row.append(textWrap, controls);
+  return row;
+}
+
 async function renderSettingsSection(content: HTMLElement): Promise<void> {
   content.innerHTML = "";
 
@@ -604,6 +673,37 @@ async function renderSettingsSection(content: HTMLElement): Promise<void> {
       "当应用失去焦点时，自动隐藏窗口。",
       closeOnBlur,
       (next) => invoke<boolean>("set_close_on_blur", { enabled: next }),
+    ),
+  );
+
+  let autoSync = false;
+  try {
+    autoSync = await invoke<boolean>("get_auto_sync");
+  } catch (err) {
+    console.error("[controlPanelView] get_auto_sync failed", err);
+  }
+  card.append(
+    createToggleRow(
+      "自动同步",
+      "新增素材后自动上传到云端并更新上传状态（需在线模式 + 已登录）。",
+      autoSync,
+      (next) => invoke<boolean>("set_auto_sync", { enabled: next }),
+    ),
+  );
+
+  let textBatchSize = 50;
+  try {
+    textBatchSize = await invoke<number>("get_text_upload_batch_size");
+  } catch (err) {
+    console.error("[controlPanelView] get_text_upload_batch_size failed", err);
+  }
+  card.append(
+    createNumberRow(
+      "文本同步批量阈值",
+      "文本素材不会逐条上传；累计到该数量后，会合并成一个 txt 文件再上传。",
+      textBatchSize,
+      (next) => invoke<number>("set_text_upload_batch_size", { batchSize: next }),
+      { min: 1, max: 500, step: 1 },
     ),
   );
 

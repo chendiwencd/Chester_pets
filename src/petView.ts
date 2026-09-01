@@ -8,8 +8,8 @@ import { backendClient } from "./backendClient";
 import {
   clipboardFileFromEvent,
   importClipboardPayload,
-  importFile,
-  importPath,
+  importFileLocalOnly,
+  importPathLocalOnly,
 } from "./materialImport";
 import type { MaterialPayload } from "./materialImport";
 
@@ -47,6 +47,7 @@ export function initPetView(root: HTMLElement): void {
 
   const AUTO_MOVE_SPEED_PX_PER_SEC = 450;
   const SLEEP_AFTER_MS = 2 * 60 * 1000;
+  const ACTIVE_TIMEOUT_MS = 30 * 1000;
   const LEAVE_GRACE_MS = 600;
   // 待机漫步：每隔 12~30s 自己走一段（复用自动移动机制，走的是正常 moving 动画），不使用额外的
   // 待机动画。方向为任意角度（上下左右都行），距离比之前更大；左右朝向由自动移动循环按水平分量镜像。
@@ -55,25 +56,20 @@ export function initPetView(root: HTMLElement): void {
   const IDLE_WANDER_MIN_DIST = 120;
   const IDLE_WANDER_MAX_DIST = 320;
   const CURSOR_FOLLOW_MS = 16;
-  const EXPLAIN_FILE_TIMEOUT_MS = 15_000;
 
-  type Mode =
-    | "waiting"
-    | "open"
-    | "preview"
-    | "moving"
-    | "sleep"
-    | "waitting_file"
-    | "explain_file";
-  let mode: Mode = "waiting";
-  let fileWaitingBeforeMode: Mode | undefined;
+  type PetMode = "idle" | "active" | "sleep" | "dragging" | "file_hover" | "file_processing";
+  type UiMode = "closed" | "panel" | "workspace";
+  let petMode: PetMode = "idle";
+  let uiMode: UiMode = "closed";
+  let fileHoverReturnMode: PetMode | undefined;
+  let fileProcessingReturnMode: PetMode | undefined;
   let fileDropCandidate = false;
-  let explainFileTimer: number | undefined;
-
-  // open 的来源：点击固定打开 或 悬浮意图打开
-  let pinnedOpen = false;
-  let hoverOpen = false;
-  let previewOpen = false;
+  let activeTimer: number | undefined;
+  let hoverVisual = false;
+  let previewVisible = false;
+  let motionVisual = false;
+  let happyVisual = false;
+  let happyTimer: number | undefined;
 
   let movingDirection: MovingDirection = "right";
   let lastStatus = store.get();
@@ -152,25 +148,38 @@ export function initPetView(root: HTMLElement): void {
     backendClient.reportStatus(status);
   });
 
-  const setStatusFromMode = () => {
+  const setStatusFromState = () => {
     const status: PetStatus =
-      mode === "waitting_file"
+      happyVisual
+        ? "happy"
+        : petMode === "file_hover"
         ? "waitting_file"
-        : mode === "sleep"
+        : petMode === "sleep"
         ? "sleep"
-        : mode === "moving"
+        : petMode === "dragging" || motionVisual
           ? "moving"
-          : mode === "open" || mode === "preview" || mode === "explain_file"
+          : petMode === "active" || petMode === "file_processing" || hoverVisual
             ? "open"
             : "waiting";
     store.setStatus(status);
   };
 
+  const triggerHappy = (reason: string) => {
+    window.clearTimeout(happyTimer);
+    happyVisual = true;
+    logToTauri(`[happy] ${reason}`);
+    setStatusFromState();
+    happyTimer = window.setTimeout(() => {
+      happyVisual = false;
+      setStatusFromState();
+    }, 1200);
+  };
+
   const syncPanelVisibility = (reason: string) => {
-    const nextVisible = mode === "open" || mode === "explain_file";
+    const nextVisible = uiMode === "panel";
     if (nextVisible === panelVisible) return;
     logToTauri(
-      `[panel visibility] ${reason} mode=${mode} pinnedOpen=${pinnedOpen} hoverOpen=${hoverOpen} previewOpen=${previewOpen} -> visible=${nextVisible}`,
+      `[panel visibility] ${reason} petMode=${petMode} uiMode=${uiMode} previewVisible=${previewVisible} hoverVisual=${hoverVisual} -> visible=${nextVisible}`,
     );
     invoke<boolean>("set_panel_visibility", { open: nextVisible })
       .then((visible) => {
@@ -179,66 +188,107 @@ export function initPetView(root: HTMLElement): void {
       .catch((err) => console.error("[petView] set_panel_visibility failed", err));
   };
 
-  const setMode = (next: Mode, reason: string) => {
-    if (mode === next) return;
-    logToTauri(`[mode] ${reason} ${mode} -> ${next}`);
-    mode = next;
-    setStatusFromMode();
-    syncPanelVisibility(`mode:${reason}`);
+  const clearActiveTimer = () => {
+    window.clearTimeout(activeTimer);
+    activeTimer = undefined;
   };
+
+  const scheduleActiveTimeout = (reason: string) => {
+    clearActiveTimer();
+    activeTimer = window.setTimeout(() => {
+      if (petMode !== "active") return;
+      logToTauri(`[active timer] timeout after ${ACTIVE_TIMEOUT_MS}ms, reason=${reason}`);
+      setPetMode("idle", "active-timeout");
+    }, ACTIVE_TIMEOUT_MS);
+  };
+
+  const setUiMode = (next: UiMode, reason: string) => {
+    if (uiMode !== next) {
+      logToTauri(`[ui mode] ${reason} ${uiMode} -> ${next}`);
+      uiMode = next;
+    }
+    syncPanelVisibility(`ui:${reason}`);
+  };
+
+  const setMotionVisual = (next: boolean, reason: string) => {
+    if (motionVisual === next) return;
+    motionVisual = next;
+    logToTauri(`[motion visual] ${reason} -> ${motionVisual}`);
+    setStatusFromState();
+  };
+
+  const setPetMode = (next: PetMode, reason: string) => {
+    if (petMode !== next) {
+      logToTauri(`[pet mode] ${reason} ${petMode} -> ${next}`);
+      petMode = next;
+    }
+    setStatusFromState();
+    if (next === "active") scheduleActiveTimeout(reason);
+    else clearActiveTimer();
+  };
+
+  const closeAllUi = (reason: string) => {
+    const shouldClosePreview = previewVisible || uiMode === "workspace";
+    setUiMode("closed", reason);
+    if (shouldClosePreview) {
+      previewVisible = false;
+      invoke("close_preview").catch((err) => console.error("[petView] close_preview failed", err));
+    }
+  };
+
+  const getRestorablePetMode = (): PetMode => (petMode === "active" ? "active" : "idle");
 
   const enterFileWaiting = (reason: string) => {
     resetInactivity(reason);
     root.classList.add("is-file-dragging");
     fileDropCandidate = true;
-    if (mode !== "waitting_file") {
-      fileWaitingBeforeMode = mode;
+    hoverVisual = false;
+    if (petMode !== "file_hover") {
+      fileHoverReturnMode = getRestorablePetMode();
     }
-    setMode("waitting_file", reason);
+    setPetMode("file_hover", reason);
   };
 
   const leaveFileWaiting = (reason: string) => {
     root.classList.remove("is-file-dragging");
-    if (mode !== "waitting_file") return;
-    const next = fileWaitingBeforeMode && fileWaitingBeforeMode !== "waitting_file"
-      ? fileWaitingBeforeMode
-      : "waiting";
-    fileWaitingBeforeMode = undefined;
-    setMode(next, reason);
+    if (petMode !== "file_hover") return;
+    const next = fileHoverReturnMode === "active" ? "active" : "idle";
+    fileHoverReturnMode = undefined;
+    setPetMode(next, reason);
   };
 
-  const finishFileExplanation = (reason: string) => {
-    window.clearTimeout(explainFileTimer);
-    explainFileTimer = undefined;
+  const finishFileProcessing = (reason: string) => {
     fileDropCandidate = false;
-    if (mode === "explain_file") {
-      setMode("waiting", reason);
-    }
+    root.classList.remove("is-file-dragging");
+    if (petMode !== "file_processing") return;
+    const next = fileProcessingReturnMode === "active" ? "active" : "idle";
+    fileProcessingReturnMode = undefined;
+    setPetMode(next, reason);
+    triggerHappy(reason);
   };
 
-  const enterFileExplanation = (reason: string) => {
-    window.clearTimeout(explainFileTimer);
-    setMode("explain_file", reason);
-    explainFileTimer = window.setTimeout(() => {
-      finishFileExplanation("file-explain-timeout");
-    }, EXPLAIN_FILE_TIMEOUT_MS);
+  const enterFileProcessing = (reason: string) => {
+    fileProcessingReturnMode = fileHoverReturnMode ?? getRestorablePetMode();
+    fileHoverReturnMode = undefined;
+    hoverVisual = false;
+    setPetMode("file_processing", reason);
   };
 
   const resetInactivity = (reason: string) => {
     window.clearTimeout(inactivityTimer);
-    if (mode === "sleep") setMode("waiting", `wake:${reason}`);
+    if (petMode === "sleep") setPetMode("idle", `wake:${reason}`);
     logToTauri(`[sleep timer] reset by ${reason}, next sleep in ${SLEEP_AFTER_MS}ms`);
     inactivityTimer = window.setTimeout(() => {
-      if (mode === "waiting") {
+      if (petMode === "idle" && uiMode === "closed") {
         logToTauri("[sleep timer] trigger sleep");
-        setMode("sleep", "inactivity");
+        setPetMode("sleep", "inactivity");
       } else {
-        logToTauri(`[sleep timer] skipped because mode=${mode}`);
+        logToTauri(`[sleep timer] skipped because petMode=${petMode} uiMode=${uiMode}`);
       }
     }, SLEEP_AFTER_MS);
   };
 
-  // 待机漫步调度：fire() 自身只在 mode==="waiting" 时才真正走一段，且总是重新排下一次，
+  // 待机漫步调度：fire() 自身只在 petMode==="idle" 且 uiMode==="closed" 时才真正走一段，且总是重新排下一次，
   // 所以只要启动时排一次就会自我延续，不需要在每个状态切换处挂钩。
   let idleWanderTimer: number | undefined;
   const scheduleIdleWander = () => {
@@ -246,12 +296,12 @@ export function initPetView(root: HTMLElement): void {
     const delay =
       IDLE_WANDER_MIN_MS + Math.random() * (IDLE_WANDER_MAX_MS - IDLE_WANDER_MIN_MS);
     idleWanderTimer = window.setTimeout(() => {
-      if (mode === "waiting") {
+      if (petMode === "idle" && uiMode === "closed") {
         // 读当前真实物理位置作为漫步起点，选一个任意角度、随机距离的目标，钳制进显示器并集后交给自动移动。
         void appWindow
           .outerPosition()
           .then((outer) => {
-            if (mode !== "waiting") return; // 读位置期间被用户交互打断
+            if (petMode !== "idle" || uiMode !== "closed") return; // 读位置期间被用户交互打断
             currentPos = { x: outer.x, y: outer.y };
             const dist =
               IDLE_WANDER_MIN_DIST +
@@ -268,7 +318,7 @@ export function initPetView(root: HTMLElement): void {
   };
 
   // 启动时进入等待态，开始计时
-  setStatusFromMode();
+  setStatusFromState();
   renderer.render(store.get(), movingDirection);
   logToTauri(`[pet init] status=${store.get()} direction=${movingDirection}`);
   resetInactivity("init");
@@ -296,11 +346,12 @@ export function initPetView(root: HTMLElement): void {
     }
     autoMoveLastTs = undefined;
     autoMoveTarget = undefined;
+    setMotionVisual(false, "autoMove:stop");
   };
 
   const ensureAutoMoveLoop = () => {
     if (autoMoveFrame !== undefined) return;
-    setMode("moving", "autoMove:start");
+    setMotionVisual(true, "autoMove:start");
     autoMoveLastTs = undefined;
 
     const tick = (ts: number) => {
@@ -328,8 +379,8 @@ export function initPetView(root: HTMLElement): void {
           logToTauri("[autoMove] arrived");
           autoMoveFrame = undefined;
           autoMoveLastTs = undefined;
+          setMotionVisual(false, "autoMove:arrived");
           scheduleSavePosition();
-          setMode("waiting", "autoMove:arrived");
           return;
         }
       } else {
@@ -416,28 +467,24 @@ export function initPetView(root: HTMLElement): void {
     onHoverChange: (hovering) => {
       resetInactivity("hoverChange");
       if (suppressHoverUntilLeave) return;
-      if (mode === "moving" || mode === "preview") return;
-      hoverOpen = hovering;
-      if (hovering) {
-        setMode("open", "hover:on");
-      } else if (!pinnedOpen && mode === "open") {
-        setMode("waiting", "hover:off");
+      if (petMode === "dragging" || petMode === "file_hover" || petMode === "file_processing") {
+        return;
       }
+      if (motionVisual) return;
+      hoverVisual = hovering;
+      setStatusFromState();
     },
     onDragStart: () => {
       resetInactivity("dragStart");
-      // 状态互斥：移动时不能是打开/预览
-      pinnedOpen = false;
-      hoverOpen = false;
-      previewOpen = false;
+      // 状态互斥：拖动时不保留 hover/界面层
+      hoverVisual = false;
       suppressHoverUntilLeave = true;
-      invoke("close_preview").catch(() => {});
-      syncPanelVisibility("dragStart");
+      closeAllUi("dragStart");
 
       // 拖动定位改为跟随全局物理光标（见 startCursorFollow），不再依赖 DOM 的 screenX/screenY。
       void refreshMonitors();
       startCursorFollow();
-      setMode("moving", "dragStart");
+      setPetMode("dragging", "dragStart");
     },
     // 定位由 startCursorFollow 负责，这里不再从 DOM 坐标算位置。
     onDragMove: () => {
@@ -447,41 +494,36 @@ export function initPetView(root: HTMLElement): void {
       resetInactivity("dragEnd");
       stopCursorFollow();
       grabOffset = undefined;
+      setPetMode("idle", "dragEnd");
       // 松手后让滑行继续走到最后一个光标目标；到达时自动移动循环会切回等待。
       if (!autoMoveTarget) {
         stopAutoMove();
-        setMode("waiting", "dragEnd:noTarget");
       }
     },
     onClick: () => {
       resetInactivity("click");
-      if (mode === "explain_file") return;
+      if (petMode === "file_processing" || petMode === "file_hover") return;
 
-      // 点击宠物是一个三段循环：等待 -> 打开(三个面板) -> 存储区(剪贴板历史) -> 等待。
-      if (mode === "open") {
-        // 打开态再次点击 -> 展开存储区。这里不用手动 setMode("preview")：
-        // open_storage 成功后 Rust 会发回 preview-state 事件，由下面的监听统一切换模式，
-        // 避免命令失败时前端状态和真实窗口对不上。
-        invoke("open_storage").catch((err) =>
-          console.error("[petView] open_storage failed", err),
-        );
+      if (petMode === "idle" || petMode === "sleep") {
+        suppressHoverUntilLeave = false;
+        setPetMode("active", "click-activate");
         return;
       }
 
-      if (mode === "preview") {
-        // 存储区已经开着，再点一次才收起回到等待
-        pinnedOpen = false;
-        hoverOpen = false;
-        previewOpen = false;
+      if (petMode === "active") {
+        if (uiMode === "closed") {
+          suppressHoverUntilLeave = false;
+          invoke("open_storage").catch((err) =>
+            console.error("[petView] open_storage failed", err),
+          );
+          setPetMode("active", "click-refresh-active");
+          return;
+        }
+
+        hoverVisual = false;
         suppressHoverUntilLeave = true;
-        invoke("close_preview").catch(() => {});
-        setMode("waiting", "click-close");
-        return;
+        setPetMode("idle", "click-idle-keep-ui");
       }
-
-      pinnedOpen = true;
-      suppressHoverUntilLeave = false;
-      setMode("open", "click-open");
     },
   });
 
@@ -567,11 +609,9 @@ export function initPetView(root: HTMLElement): void {
   };
 
   const canImportFiles = () =>
-    mode === "open" ||
-    (mode === "waitting_file" && fileWaitingBeforeMode === "open") ||
-    panelVisible;
+    petMode !== "dragging" && petMode !== "file_processing";
 
-  const showImportedPayload = (payload: Awaited<ReturnType<typeof importPath>>) => {
+  const showImportedPayload = (payload: MaterialPayload | null | undefined) => {
     if (!payload) return;
     logToTauri(`[material import] ${payload.kind} ${payload.name} overview=${payload.overview ? "yes" : "no"}`);
   };
@@ -609,24 +649,18 @@ export function initPetView(root: HTMLElement): void {
       logToTauri(
         `[material drop] kind=${isImageFile(file) ? "image" : "file"} size=${formatFileSize(file.size)}`,
       );
-      void importFile(file)
-        .then(showImportedPayload)
+      enterFileProcessing("file-drop");
+      void importFileLocalOnly(file)
+        .then((payload) => {
+          showImportedPayload(payload);
+          finishFileProcessing("file-drop:done");
+        })
         .catch((err) => console.error("[petView] importFile failed", err));
     } else {
       const imageSource = imageSourceFromTransfer(event.dataTransfer);
       if (imageSource && allowed) {
-        invoke("show_file_info", {
-          payload: {
-            kind: "image",
-            name: imageSource.split(/[\\/]/).pop() || "拖拽图片",
-            size_bytes: null,
-            mime_type: null,
-            display_size: "",
-            overview: "",
-            type_placeholder: "",
-            preview: imageSource,
-          },
-        }).catch((err) => console.error("[petView] show_file_info failed", err));
+        // 浏览器图片 URL / HTML 拖拽：暂不支持无路径的导入（避免打开 file info panel 干扰交互）。
+        logToTauri(`[material drop] ignore non-file image source=${imageSource}`);
       }
     }
     leaveFileWaiting("file-drop");
@@ -635,13 +669,16 @@ export function initPetView(root: HTMLElement): void {
   void appWindow.listen<string>("file-dropped", (event) => {
     const allowed = canImportFiles() || fileDropCandidate;
     logToTauri(
-      `[native file-dropped] allowed=${allowed} mode=${mode} before=${fileWaitingBeforeMode ?? "none"} panelVisible=${panelVisible} candidate=${fileDropCandidate} path=${event.payload}`,
+      `[native file-dropped] allowed=${allowed} petMode=${petMode} uiMode=${uiMode} panelVisible=${panelVisible} candidate=${fileDropCandidate} path=${event.payload}`,
     );
     if (!allowed) return;
     fileDropCandidate = false;
-    enterFileExplanation("native-file-drop");
-    void importPath(event.payload)
-      .then(showImportedPayload)
+    enterFileProcessing("native-file-drop");
+    void importPathLocalOnly(event.payload)
+      .then((payload) => {
+        showImportedPayload(payload);
+        finishFileProcessing("native-file-drop:done");
+      })
       .catch((err) => console.error("[petView] importPath failed", err));
   });
 
@@ -653,11 +690,14 @@ export function initPetView(root: HTMLElement): void {
   window.addEventListener(
     "paste",
     (event) => {
-      if (mode !== "open") return;
+      if (uiMode !== "panel") return;
       event.preventDefault();
       const file = clipboardFileFromEvent(event);
       if (file) {
-        void importFile(file).catch((err) => console.error("[petView] paste file import failed", err));
+        enterFileProcessing("paste-file");
+        void importFileLocalOnly(file)
+          .then(() => finishFileProcessing("paste-file:done"))
+          .catch((err) => console.error("[petView] paste file import failed", err));
         return;
       }
       invoke<MaterialPayload | null>("paste_clipboard_to_input_panel")
@@ -669,40 +709,33 @@ export function initPetView(root: HTMLElement): void {
 
   // 应用整体失焦：关闭一切，回到等待（但不直接进入 sleep，sleep 由计时器控制）
   void appWindow.listen("app-deactivated", () => {
-    if (mode === "explain_file") return;
-    pinnedOpen = false;
-    hoverOpen = false;
-    previewOpen = false;
-    invoke("close_preview").catch(() => {});
+    if (petMode === "file_processing") return;
+    hoverVisual = false;
     stopCursorFollow();
     grabOffset = undefined;
     stopAutoMove();
-    setMode("waiting", "app-deactivated");
+    closeAllUi("app-deactivated");
+    setPetMode("idle", "app-deactivated");
   });
 
-  void appWindow.listen("file-explanation-complete", () => {
-    finishFileExplanation("file-explain-complete");
-  });
+  // file-explanation-complete：旧流程用于关闭文件说明面板。当前拖拽导入为静默保存，不再依赖该事件。
 
   // 预览打开/关闭：保持打开态，但预览态只显示预览窗口
   void appWindow.listen<{ open: boolean }>("preview-state", (event) => {
     const open = !!event.payload.open;
     // sleep 期间收起预览不应被视为“用户交互”，否则会立刻唤醒
-    if (mode === "sleep" && !open) {
-      previewOpen = false;
+    if (petMode === "sleep" && !open) {
+      previewVisible = false;
       logToTauri("[preview state] ignore close while sleeping");
       return;
     }
 
     resetInactivity("preview-state");
-    previewOpen = open;
-    if (previewOpen) {
-      pinnedOpen = true; // 进入预览视为用户明确打开
-      setMode("preview", "preview-open");
+    previewVisible = open;
+    if (previewVisible) {
+      setUiMode("workspace", "preview-open");
     } else {
-      // 关闭预览后展开三个窗口（仍处于打开态）
-      if (pinnedOpen || hoverOpen) setMode("open", "preview-close");
-      else setMode("waiting", "preview-close");
+      setUiMode("closed", "preview-close");
     }
   });
 

@@ -33,7 +33,9 @@ impl Database {
                 preview TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL,
                 pinned INTEGER NOT NULL DEFAULT 0,
-                pinned_at_ms INTEGER
+                pinned_at_ms INTEGER,
+                upload_state TEXT,
+                remote_file_id TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_history_items_created
@@ -61,6 +63,8 @@ impl Database {
                 ON resources(history_item_id, sort_order);
             ",
         )?;
+        ensure_history_column(&connection, "upload_state")?;
+        ensure_history_column(&connection, "remote_file_id")?;
         ensure_resource_column(&connection, "extracted_text")?;
         ensure_resource_column(&connection, "remote_file_id")?;
 
@@ -70,7 +74,8 @@ impl Database {
     pub fn load_history(&self) -> Result<Vec<ClipboardHistoryItem>> {
         let mut statement = self.connection.prepare(
             "
-            SELECT id, kind, value, preview, created_at_ms, pinned, pinned_at_ms
+            SELECT id, kind, value, preview, created_at_ms, pinned, pinned_at_ms,
+                   upload_state, remote_file_id
             FROM history_items
             ORDER BY id ASC
             ",
@@ -90,13 +95,22 @@ impl Database {
         value: &str,
         preview: &str,
         created_at_ms: u64,
+        upload_state: Option<&str>,
+        remote_file_id: Option<&str>,
         resources: &[SavedResourceInput],
     ) -> Result<(ClipboardHistoryItem, bool)> {
+        let upload_state = upload_state.unwrap_or("not_uploaded").trim().to_string();
+        let remote_file_id = remote_file_id
+            .and_then(|value| {
+                let trimmed = value.trim();
+                (!trimmed.is_empty()).then_some(trimmed.to_string())
+            });
         let transaction = self.connection.transaction()?;
         let existing = transaction
             .query_row(
                 "
-                SELECT id, kind, value, preview, created_at_ms, pinned, pinned_at_ms
+                SELECT id, kind, value, preview, created_at_ms, pinned, pinned_at_ms,
+                       upload_state, remote_file_id
                 FROM history_items
                 WHERE kind = ?1 AND value = ?2
                 LIMIT 1
@@ -122,10 +136,20 @@ impl Database {
 
         transaction.execute(
             "
-            INSERT INTO history_items(kind, value, preview, created_at_ms, pinned, pinned_at_ms)
-            VALUES (?1, ?2, ?3, ?4, 0, NULL)
+            INSERT INTO history_items(
+                kind, value, preview, created_at_ms, pinned, pinned_at_ms,
+                upload_state, remote_file_id
+            )
+            VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5, ?6)
             ",
-            params![kind, value, preview, created_at_ms as i64],
+            params![
+                kind,
+                value,
+                preview,
+                created_at_ms as i64,
+                upload_state,
+                remote_file_id
+            ],
         )?;
         let id = transaction.last_insert_rowid();
 
@@ -160,11 +184,13 @@ impl Database {
                 kind: kind.to_string(),
                 value: value.to_string(),
                 preview: preview.to_string(),
-            created_at_ms,
-            pinned: false,
-            pinned_at_ms: None,
-            resources: resources.to_vec(),
-        },
+                created_at_ms,
+                pinned: false,
+                pinned_at_ms: None,
+                upload_state: Some(upload_state),
+                remote_file_id,
+                resources: resources.to_vec(),
+            },
             true,
         ))
     }
@@ -190,7 +216,8 @@ impl Database {
             .connection
             .query_row(
                 "
-                SELECT id, kind, value, preview, created_at_ms, pinned, pinned_at_ms
+                SELECT id, kind, value, preview, created_at_ms, pinned, pinned_at_ms,
+                       upload_state, remote_file_id
                 FROM history_items
                 WHERE id = ?1
                 ",
@@ -223,7 +250,8 @@ impl Database {
         self.connection
             .query_row(
                 "
-                SELECT id, kind, value, preview, created_at_ms, pinned, pinned_at_ms
+                SELECT id, kind, value, preview, created_at_ms, pinned, pinned_at_ms,
+                       upload_state, remote_file_id
                 FROM history_items
                 WHERE id = ?1
                 ",
@@ -261,7 +289,8 @@ impl Database {
             .connection
             .query_row(
                 "
-                SELECT id, kind, value, preview, created_at_ms, pinned, pinned_at_ms
+                SELECT id, kind, value, preview, created_at_ms, pinned, pinned_at_ms,
+                       upload_state, remote_file_id
                 FROM history_items
                 WHERE id = ?1
                 ",
@@ -272,6 +301,100 @@ impl Database {
         updated.resources = load_resources(&self.connection, id)?;
         Ok(Some(updated))
     }
+
+    pub fn update_upload_state(
+        &mut self,
+        id: u64,
+        upload_state: &str,
+        remote_file_id: Option<&str>,
+        overview: Option<&str>,
+        extracted_text: Option<&str>,
+    ) -> Result<Option<ClipboardHistoryItem>> {
+        let exists = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM history_items WHERE id = ?1",
+                params![id as i64],
+                |_| Ok(()),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+
+        let upload_state = upload_state.trim();
+        let remote_file_id = remote_file_id
+            .and_then(|value| {
+                let trimmed = value.trim();
+                (!trimmed.is_empty()).then_some(trimmed.to_string())
+            });
+
+        self.connection.execute(
+            "UPDATE history_items SET upload_state = ?1, remote_file_id = ?2 WHERE id = ?3",
+            params![upload_state, remote_file_id, id as i64],
+        )?;
+
+        // file/image 的概述/文本保存在 resources 表里；同步完成时可以把 AI 结果回写进去。
+        let overview = overview
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let extracted_text = extracted_text
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if overview.is_some() || extracted_text.is_some() || remote_file_id.is_some() {
+            // 只有 file/image 类型才把 AI 结果回写到 resources（note 可能也有 resources，但那是附件，不能被覆盖）。
+            let kind: String = self.connection.query_row(
+                "SELECT kind FROM history_items WHERE id = ?1",
+                params![id as i64],
+                |row| row.get(0),
+            )?;
+            if kind == "file" || kind == "image" {
+                // 只更新该 history_item 的第一条资源（默认只有一条）。
+                self.connection.execute(
+                    "
+                    UPDATE resources
+                    SET summary = COALESCE(?1, summary),
+                        extracted_text = COALESCE(?2, extracted_text),
+                        remote_file_id = COALESCE(?3, remote_file_id)
+                    WHERE history_item_id = ?4 AND sort_order = 0
+                    ",
+                    params![overview, extracted_text, remote_file_id, id as i64],
+                )?;
+            }
+        }
+
+        let mut updated = self.connection.query_row(
+            "
+            SELECT id, kind, value, preview, created_at_ms, pinned, pinned_at_ms,
+                   upload_state, remote_file_id
+            FROM history_items
+            WHERE id = ?1
+            ",
+            params![id as i64],
+            history_item_from_row,
+        )?;
+        updated.resources = load_resources(&self.connection, id)?;
+        Ok(Some(updated))
+    }
+}
+
+fn ensure_history_column(connection: &Connection, column: &str) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(history_items)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(());
+        }
+    }
+
+    let sql = match column {
+        "upload_state" | "remote_file_id" => {
+            format!("ALTER TABLE history_items ADD COLUMN {column} TEXT")
+        }
+        _ => return Err(rusqlite::Error::InvalidParameterName(column.to_string())),
+    };
+    connection.execute(&sql, [])?;
+    Ok(())
 }
 
 fn ensure_resource_column(connection: &Connection, column: &str) -> Result<()> {
@@ -302,6 +425,8 @@ fn history_item_from_row(row: &rusqlite::Row<'_>) -> Result<ClipboardHistoryItem
         created_at_ms: row.get::<_, i64>(4)? as u64,
         pinned: row.get::<_, i64>(5)? != 0,
         pinned_at_ms: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+        upload_state: row.get(7)?,
+        remote_file_id: row.get(8)?,
         resources: Vec::new(),
     })
 }

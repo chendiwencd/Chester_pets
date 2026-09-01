@@ -3966,6 +3966,30 @@ body {
   word-break: break-word;
 }
 
+.preview-workspace .workspace-translate-button {
+  height: 30px;
+  padding: 0 11px;
+}
+
+.preview-workspace .workspace-detail-translation {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.preview-workspace .workspace-detail-translation-label {
+  padding-left: 2px;
+  color: #9a7d68;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.preview-workspace .workspace-detail-translation-text {
+  margin: 0;
+  background: rgba(245, 236, 223, 0.78);
+}
+
 .preview-workspace .workspace-side-column {
   min-height: 0;
   overflow: hidden;

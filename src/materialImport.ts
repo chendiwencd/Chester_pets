@@ -227,3 +227,31 @@ export async function importClipboardPayload(
   if (!path) return payload;
   return importPath(path);
 }
+
+// -----------------------------
+// 新导入链路：只本地保存（不请求 fileReader，不打开 file info panel）
+// -----------------------------
+
+export async function importPathLocalOnly(path: string): Promise<MaterialPayload | null> {
+  const trimmed = path.trim();
+  if (!trimmed) return null;
+  // 静默保存：后端负责复制到 workspace_dir + 写入 history/resources，并通过 history-appended 让素材区刷新
+  return invoke<MaterialPayload | null>("save_file_to_material_silent", { path: trimmed });
+}
+
+export async function importFileLocalOnly(file: File): Promise<MaterialPayload | null> {
+  const path = filePath(file);
+  if (path) {
+    return importPathLocalOnly(path);
+  }
+
+  const name = file.name || "document";
+  const dataUrl = await readFileAsDataUrl(file);
+  if (!dataUrl) return null;
+  // data_url 里自带 mime；这里仍把 file.type 作为显式 mime_type 传给后端做兜底
+  return invoke<MaterialPayload | null>("save_file_data_url_to_material_silent", {
+    name,
+    mime_type: file.type || null,
+    data_url: dataUrl,
+  });
+}

@@ -149,6 +149,40 @@ pub fn set_close_on_blur(app: AppHandle, enabled: bool) -> bool {
 }
 
 #[tauri::command]
+pub fn get_auto_sync(app: AppHandle) -> bool {
+    crate::state::load_settings(&app).auto_sync
+}
+
+#[tauri::command]
+pub fn set_auto_sync(app: AppHandle, enabled: bool) -> bool {
+    let mut settings = crate::state::load_settings(&app);
+    settings.auto_sync = enabled;
+    if let Err(err) = crate::state::save_settings(&app, &settings) {
+        eprintln!("[auto_sync] failed to save enabled={enabled}: {err}");
+        return settings.auto_sync;
+    }
+    enabled
+}
+
+#[tauri::command]
+pub fn get_text_upload_batch_size(app: AppHandle) -> u32 {
+    crate::state::load_settings(&app).text_upload_batch_size
+}
+
+#[tauri::command]
+pub fn set_text_upload_batch_size(app: AppHandle, batch_size: u32) -> u32 {
+    // 保护：避免 0 或过大导致 UI 卡死。上限先给一个保守值。
+    let batch_size = batch_size.clamp(1, 500);
+    let mut settings = crate::state::load_settings(&app);
+    settings.text_upload_batch_size = batch_size;
+    if let Err(err) = crate::state::save_settings(&app, &settings) {
+        eprintln!("[text_upload_batch_size] failed to save batch_size={batch_size}: {err}");
+        return settings.text_upload_batch_size;
+    }
+    batch_size
+}
+
+#[tauri::command]
 pub fn get_shortcut_settings(state: State<AppState>) -> crate::state::ShortcutSettings {
     state.shortcuts.lock().unwrap().clone()
 }
@@ -431,6 +465,19 @@ pub fn show_file_info_for_path_with_summary(
     extracted_text: Option<String>,
     remote_file_id: Option<String>,
 ) -> Option<FileInfoPayload> {
+    let payload =
+        persist_file_info_for_path_with_summary(app, path, overview, extracted_text, remote_file_id)?;
+    show_file_info_payload(app, payload.clone());
+    Some(payload)
+}
+
+fn persist_file_info_for_path_with_summary(
+    app: &AppHandle,
+    path: &Path,
+    overview: Option<String>,
+    extracted_text: Option<String>,
+    remote_file_id: Option<String>,
+) -> Option<FileInfoPayload> {
     let stored_path = match crate::state::copy_file_to_workspace(app, path) {
         Ok(path) => path,
         Err(err) => {
@@ -494,7 +541,6 @@ pub fn show_file_info_for_path_with_summary(
         preview: stored_value,
         file_id: remote_file_id,
     };
-    show_file_info_payload(app, payload.clone());
     Some(payload)
 }
 
@@ -573,6 +619,22 @@ pub fn save_file_to_material(
 }
 
 #[tauri::command]
+pub fn save_file_to_material_silent(
+    app: AppHandle,
+    path: String,
+    overview: Option<String>,
+    extracted_text: Option<String>,
+    remote_file_id: Option<String>,
+) -> Option<FileInfoPayload> {
+    let path = Path::new(path.trim());
+    if !path.is_file() {
+        eprintln!("[workspace] dropped path is not a file: {}", path.display());
+        return None;
+    }
+    persist_file_info_for_path_with_summary(&app, path, overview, extracted_text, remote_file_id)
+}
+
+#[tauri::command]
 pub fn read_file_data_url(value: String) -> Option<String> {
     if value.starts_with("data:") {
         return Some(value);
@@ -610,6 +672,46 @@ pub fn save_file_data_url_to_material(
     let temp_path = temp_dir.join(file_name);
     std::fs::write(&temp_path, bytes).ok()?;
     let mut payload = show_file_info_for_path_with_summary(
+        &app,
+        &temp_path,
+        overview,
+        extracted_text,
+        remote_file_id,
+    );
+    let _ = std::fs::remove_dir_all(temp_dir);
+    if let (Some(payload), Some(mime_type)) = (payload.as_mut(), mime_type) {
+        payload.mime_type = Some(mime_type);
+    }
+    payload
+}
+
+#[tauri::command]
+pub fn save_file_data_url_to_material_silent(
+    app: AppHandle,
+    name: String,
+    mime_type: Option<String>,
+    data_url: String,
+    overview: Option<String>,
+    extracted_text: Option<String>,
+    remote_file_id: Option<String>,
+) -> Option<FileInfoPayload> {
+    let (_, encoded) = data_url.split_once(',')?;
+    let bytes = STANDARD.decode(encoded.trim()).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let temp_dir = app.path().temp_dir().ok()?.join(format!(
+        "desktop-shell-import-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_nanos(),
+    ));
+    std::fs::create_dir_all(&temp_dir).ok()?;
+    let file_name = Path::new(name.trim())
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("document");
+    let temp_path = temp_dir.join(file_name);
+    std::fs::write(&temp_path, bytes).ok()?;
+    let mut payload = persist_file_info_for_path_with_summary(
         &app,
         &temp_path,
         overview,
@@ -932,7 +1034,15 @@ pub fn create_note_history_item(
     };
 
     let result = crate::db::database_mut(&app, |database| {
-        database.insert_history("note", &normalized_value, &preview, created_at_ms, &[])
+        database.insert_history(
+            "note",
+            &normalized_value,
+            &preview,
+            created_at_ms,
+            Some("not_uploaded"),
+            None,
+            &[],
+        )
     });
     let Ok(((item, inserted), history)) = result.and_then(|result| {
         crate::db::database_mut(&app, |database| database.load_history()).map(|history| (result, history))
@@ -1067,6 +1177,36 @@ pub fn update_clipboard_history_item(
         *item = updated.clone();
     }
 
+    let _ = app.emit_to("preview", "history-updated", updated);
+}
+
+#[tauri::command]
+pub fn update_history_upload_state(
+    app: AppHandle,
+    state: State<AppState>,
+    id: u64,
+    upload_state: String,
+    remote_file_id: Option<String>,
+    overview: Option<String>,
+    extracted_text: Option<String>,
+) {
+    let Ok(Some(updated)) = crate::db::database_mut(&app, |database| {
+        database.update_upload_state(
+            id,
+            upload_state.as_str(),
+            remote_file_id.as_deref(),
+            overview.as_deref(),
+            extracted_text.as_deref(),
+        )
+    }) else {
+        return;
+    };
+
+    if let Ok(history) = crate::db::database_mut(&app, |database| database.load_history()) {
+        *state.clipboard_history.lock().unwrap() = history;
+    }
+
+    // 和 update_clipboard_history_item 对齐：发 history-updated 让 preview 端刷新 UI。
     let _ = app.emit_to("preview", "history-updated", updated);
 }
 

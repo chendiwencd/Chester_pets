@@ -409,6 +409,62 @@ function renderAccountSection(root: HTMLElement, mode: AuthMode, setMode: (mode:
   root.append(card);
 }
 
+function createNumberRow(
+  title: string,
+  description: string,
+  initial: number,
+  onSave: (value: number) => Promise<number>,
+  options: { min: number; max: number; step?: number } = { min: 1, max: 500, step: 1 },
+): HTMLElement {
+  const row = createElement("div", "workspace-settings-row");
+  const copy = createElement("div", "workspace-settings-copy");
+  copy.append(
+    createElement("div", "workspace-settings-row-title", title),
+    createElement("p", "workspace-settings-row-description", description),
+  );
+
+  const controls = createElement("div", "workspace-settings-directory-controls");
+  const input = createElement("input", "workspace-settings-directory-input") as HTMLInputElement;
+  input.type = "number";
+  input.min = String(options.min);
+  input.max = String(options.max);
+  input.step = String(options.step ?? 1);
+  input.value = String(initial);
+
+  const saveButton = createElement("button", "workspace-settings-secondary-button", "保存");
+  saveButton.type = "button";
+  const status = createElement("span", "workspace-settings-directory-status");
+  status.setAttribute("role", "status");
+
+  let current = initial;
+  const sync = () => {
+    const next = Number(input.value);
+    const valid = Number.isFinite(next) && next >= options.min && next <= options.max;
+    saveButton.disabled = !valid || next === current;
+  };
+  sync();
+  input.addEventListener("input", sync);
+
+  saveButton.addEventListener("click", async () => {
+    saveButton.disabled = true;
+    status.textContent = "保存中…";
+    try {
+      const next = await onSave(Number(input.value));
+      current = next;
+      input.value = String(next);
+      status.textContent = "已生效";
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : String(error);
+    } finally {
+      sync();
+    }
+  });
+
+  controls.append(input, saveButton, status);
+  row.append(copy, controls);
+  return row;
+}
+
 async function renderGeneralSection(root: HTMLElement): Promise<void> {
   root.replaceChildren();
   const card = createElement("section", "workspace-settings-card");
@@ -452,6 +508,37 @@ async function renderGeneralSection(root: HTMLElement): Promise<void> {
       "当应用失去焦点时，自动隐藏窗口。",
       closeOnBlur,
       (next) => invoke<boolean>("set_close_on_blur", { enabled: next }),
+    ),
+  );
+
+  let autoSync = false;
+  try {
+    autoSync = await invoke<boolean>("get_auto_sync");
+  } catch (error) {
+    console.error("[workspaceSettingsView] get_auto_sync failed", error);
+  }
+  card.append(
+    createToggleRow(
+      "自动同步",
+      "新增素材后自动上传到云端并更新上传状态（需在线模式 + 已登录）。",
+      autoSync,
+      (next) => invoke<boolean>("set_auto_sync", { enabled: next }),
+    ),
+  );
+
+  let textBatchSize = 50;
+  try {
+    textBatchSize = await invoke<number>("get_text_upload_batch_size");
+  } catch (error) {
+    console.error("[workspaceSettingsView] get_text_upload_batch_size failed", error);
+  }
+  card.append(
+    createNumberRow(
+      "文本同步批量阈值",
+      "文本素材不会逐条上传；累计到该数量后，会合并成一个 txt 文件再上传。",
+      textBatchSize,
+      (next) => invoke<number>("set_text_upload_batch_size", { batchSize: next }),
+      { min: 1, max: 500, step: 1 },
     ),
   );
 

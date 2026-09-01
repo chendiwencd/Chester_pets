@@ -87,6 +87,10 @@ pub struct ClipboardHistoryItem {
     pub pinned: bool,
     pub pinned_at_ms: Option<u64>,
     #[serde(default)]
+    pub upload_state: Option<String>,
+    #[serde(default)]
+    pub remote_file_id: Option<String>,
+    #[serde(default)]
     pub resources: Vec<SavedResourceInput>,
 }
 
@@ -117,6 +121,12 @@ pub struct AppSettings {
     pub shortcuts: ShortcutSettings,
     #[serde(default = "default_workspace_dir")]
     pub workspace_dir: String,
+    // 自动同步：默认关。#[serde(default)] 保证旧版 settings.json 没有该字段时也能正常加载。
+    #[serde(default)]
+    pub auto_sync: bool,
+    // 文本素材批量上传阈值：默认 50。只对 text/web/note 生效。
+    #[serde(default = "default_text_upload_batch_size")]
+    pub text_upload_batch_size: u32,
 }
 
 fn default_workspace_dir() -> String {
@@ -127,6 +137,10 @@ fn default_close_on_blur() -> bool {
     true
 }
 
+fn default_text_upload_batch_size() -> u32 {
+    50
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -135,6 +149,8 @@ impl Default for AppSettings {
             autostart: false,
             shortcuts: ShortcutSettings::default(),
             workspace_dir: default_workspace_dir(),
+            auto_sync: false,
+            text_upload_batch_size: default_text_upload_batch_size(),
         }
     }
 }

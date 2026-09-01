@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { apiClient } from "./api/authClient";
+import { authStore } from "./authStore";
 import { resolveImageSrc } from "./media";
 import { createWorkspaceIcon, type WorkspaceIconName } from "./workspaceIcons";
 import { initWorkspaceSettingsPage } from "./workspaceSettingsPage";
@@ -27,8 +29,12 @@ interface ClipboardHistoryItem {
   created_at_ms: number;
   pinned: boolean;
   pinned_at_ms?: number | null;
+  upload_state?: UploadState;
+  remote_file_id?: string | null;
   resources?: SavedResource[];
 }
+
+type UploadState = "not_uploaded" | "uploading" | "uploaded" | "failed";
 
 interface SavedResourceSummary {
   id?: number; // 资源的 history item id
@@ -59,6 +65,8 @@ interface AssetSelection {
   imageValue?: string;
   id?: number;
   pinned?: boolean;
+  uploadState?: UploadState;
+  remoteFileId?: string | null;
 }
 
 interface NoteSelection {
@@ -70,7 +78,30 @@ interface NoteSelection {
   createdAtLabel: string;
   id?: number;
   pinned?: boolean;
+  uploadState?: UploadState;
+  remoteFileId?: string | null;
 }
+
+function normalizedUploadState(item: ClipboardHistoryItem): UploadState {
+  const state = item.upload_state;
+  if (state === "uploaded" || state === "uploading" || state === "failed" || state === "not_uploaded") {
+    return state;
+  }
+  return item.remote_file_id ? "uploaded" : "not_uploaded";
+}
+
+interface AssetTranslationState {
+  key: string;
+  source: string;
+  status: "loading" | "success" | "error";
+  translatedText?: string;
+  error?: string;
+}
+
+function assetTranslationKey(selection: AssetSelection): string {
+  return `${selection.id ?? "transient"}:${selection.content ?? ""}`;
+}
+
 function parseNoteWithResources(value: string): { text: string; resources: SavedResourceSummary[] } {
   const parts = value.split(NOTE_RESOURCE_MARKER);
   if (parts.length < 2) {
@@ -300,6 +331,8 @@ function assetSelectionFromItem(item: ClipboardHistoryItem): AssetSelection {
     imageValue: item.kind === "image" ? item.value : undefined,
     id: item.id,
     pinned: item.pinned,
+    uploadState: normalizedUploadState(item),
+    remoteFileId: item.remote_file_id ?? null,
   };
 }
 
@@ -317,6 +350,8 @@ function assetSelectionFromPayload(payload: PanelContentPayload): AssetSelection
       { label: "描述", value: payload.kind === "image" ? "图片素材，点击可查看原图。" : payload.kind === "file" ? "文件素材。" : normalizeText(payload.value) || "暂无描述" },
     ],
     imageValue: payload.kind === "image" ? payload.value : undefined,
+    uploadState: "not_uploaded",
+    remoteFileId: null,
   };
 }
 
@@ -331,6 +366,8 @@ function noteSelectionFromItem(item: ClipboardHistoryItem): NoteSelection {
     createdAtLabel: formatTime(item.created_at_ms),
     id: item.id,
     pinned: item.pinned,
+    uploadState: normalizedUploadState(item),
+    remoteFileId: item.remote_file_id ?? null,
   };
 }
 
@@ -343,6 +380,8 @@ function noteSelectionFromPayload(payload: PanelContentPayload): NoteSelection {
     text: parsed.text,
     resources: parsed.resources,
     createdAtLabel: "临时查看",
+    uploadState: "not_uploaded",
+    remoteFileId: null,
   };
 }
 
@@ -490,6 +529,9 @@ function renderAssetDetail(
   onPin?: () => void,
   onCopy?: () => void,
   onDelete?: () => void,
+  translation?: AssetTranslationState,
+  onTranslate?: () => void,
+  onSync?: () => void,
 ): void {
   root.innerHTML = "";
   if (!selection) {
@@ -504,7 +546,48 @@ function renderAssetDetail(
     const kicker = document.createElement("p");
     kicker.className = "workspace-kicker";
     kicker.textContent = "内容";
-    header.appendChild(kicker);
+    const badges = document.createElement("div");
+    badges.className = "workspace-detail-badges";
+
+    const uploadState = selection.uploadState ?? "not_uploaded";
+    if (selection.id) {
+      const uploadPill = document.createElement("span");
+      uploadPill.className = "workspace-status-pill is-soft";
+      uploadPill.textContent =
+        uploadState === "uploaded"
+          ? "已上传"
+          : uploadState === "uploading"
+            ? "上传中"
+            : uploadState === "failed"
+              ? "上传失败"
+              : "未上传";
+      badges.appendChild(uploadPill);
+    }
+    const translateButton = document.createElement("button");
+    translateButton.type = "button";
+    translateButton.className = "workspace-action-button workspace-translate-button";
+    translateButton.textContent = translation?.status === "loading" ? "正在翻译" : "翻译";
+    translateButton.disabled = translation?.status === "loading";
+    translateButton.addEventListener("click", () => onTranslate?.());
+    badges.appendChild(translateButton);
+
+    if (selection.id && uploadState !== "uploaded") {
+      const authState = authStore.getState();
+      const syncButton = document.createElement("button");
+      syncButton.type = "button";
+      syncButton.className = "workspace-action-button";
+      syncButton.textContent = uploadState === "uploading" ? "同步中" : "同步";
+      const disabled =
+        uploadState === "uploading" || !authState.onlineMode || !authState.isLoggedIn;
+      syncButton.disabled = disabled;
+      syncButton.title = disabled && (!authState.onlineMode || !authState.isLoggedIn)
+        ? "需开启在线模式并登录后才可同步"
+        : "同步到云端";
+      syncButton.addEventListener("click", () => onSync?.());
+      badges.appendChild(syncButton);
+    }
+
+    header.append(kicker, badges);
     root.appendChild(header);
 
     const scroll = document.createElement("div");
@@ -513,6 +596,26 @@ function renderAssetDetail(
     content.className = "workspace-detail-text";
     content.textContent = selection.content ?? selection.summary ?? "";
     scroll.appendChild(content);
+
+    if (translation) {
+      const translationBlock = document.createElement("div");
+      translationBlock.className = "workspace-detail-translation";
+      const translationLabel = document.createElement("div");
+      translationLabel.className = "workspace-detail-translation-label";
+      translationLabel.textContent = translation.status === "error" ? "翻译失败" : "翻译";
+      translationBlock.appendChild(translationLabel);
+
+      const translationContent = document.createElement("div");
+      translationContent.className = "workspace-detail-text workspace-detail-translation-text";
+      translationContent.textContent =
+        translation.status === "loading"
+          ? "正在翻译..."
+          : translation.status === "error"
+            ? translation.error ?? "翻译失败"
+            : translation.translatedText ?? "未返回翻译结果";
+      translationBlock.appendChild(translationContent);
+      scroll.appendChild(translationBlock);
+    }
     root.appendChild(scroll);
 
     if (selection.id) {
@@ -544,10 +647,44 @@ function renderAssetDetail(
   const kicker = document.createElement("p");
   kicker.className = "workspace-kicker";
   kicker.textContent = "素材信息";
+  const badges = document.createElement("div");
+  badges.className = "workspace-detail-badges";
   const status = document.createElement("span");
   status.className = "workspace-status-pill is-soft";
   status.textContent = selection.pinned ? "已置顶" : selection.createdAtLabel;
-  header.appendChild(kicker);
+  badges.appendChild(status);
+
+  const uploadState = selection.uploadState ?? "not_uploaded";
+  if (selection.id) {
+    const uploadPill = document.createElement("span");
+    uploadPill.className = "workspace-status-pill is-soft";
+    uploadPill.textContent =
+      uploadState === "uploaded"
+        ? "已上传"
+        : uploadState === "uploading"
+          ? "上传中"
+          : uploadState === "failed"
+            ? "上传失败"
+            : "未上传";
+    badges.appendChild(uploadPill);
+  }
+
+  if (selection.id && uploadState !== "uploaded") {
+    const authState = authStore.getState();
+    const syncButton = document.createElement("button");
+    syncButton.type = "button";
+    syncButton.className = "workspace-action-button";
+    syncButton.textContent = uploadState === "uploading" ? "同步中" : "同步";
+    const disabled = uploadState === "uploading" || !authState.onlineMode || !authState.isLoggedIn;
+    syncButton.disabled = disabled;
+    syncButton.title = disabled && (!authState.onlineMode || !authState.isLoggedIn)
+      ? "需开启在线模式并登录后才可同步"
+      : "同步到云端";
+    syncButton.addEventListener("click", () => onSync?.());
+    badges.appendChild(syncButton);
+  }
+
+  header.append(kicker, badges);
   root.appendChild(header);
 
   const detailScroll = document.createElement("div");
@@ -764,6 +901,7 @@ function renderNotebookDetail(
   onPin?: () => void,
   onCopy?: () => void,
   onDelete?: () => void,
+  onSync?: () => void,
   onSave?: (title: string, text: string) => void,
   allMaterials?: SavedResourceSummary[],
   editorState?: { isEditing: boolean; title: string; text: string },
@@ -947,6 +1085,35 @@ function renderNotebookDetail(
       pinButton.classList.toggle("is-active", selection.pinned);
       pinButton.addEventListener("click", () => onPin?.());
       badges.appendChild(pinButton);
+
+      const uploadState = selection.uploadState ?? "not_uploaded";
+      const uploadPill = document.createElement("span");
+      uploadPill.className = "workspace-status-pill is-soft";
+      uploadPill.textContent =
+        uploadState === "uploaded"
+          ? "已上传"
+          : uploadState === "uploading"
+            ? "上传中"
+            : uploadState === "failed"
+              ? "上传失败"
+              : "未上传";
+      badges.appendChild(uploadPill);
+
+      if (uploadState !== "uploaded") {
+        const authState = authStore.getState();
+        const syncButton = document.createElement("button");
+        syncButton.type = "button";
+        syncButton.className = "workspace-action-button";
+        syncButton.textContent = uploadState === "uploading" ? "同步中" : "同步";
+        const disabled =
+          uploadState === "uploading" || !authState.onlineMode || !authState.isLoggedIn;
+        syncButton.disabled = disabled;
+        syncButton.title = disabled && (!authState.onlineMode || !authState.isLoggedIn)
+          ? "需开启在线模式并登录后才可同步"
+          : "同步到云端";
+        syncButton.addEventListener("click", () => onSync?.());
+        badges.appendChild(syncButton);
+      }
     }
     header.append(headerCopy, badges);
     root.appendChild(header);
@@ -1488,6 +1655,200 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   let notebookEditor:
     | { id: number | null; isEditing: boolean; title: string; text: string; creating?: boolean }
     | undefined;
+  let assetTranslation: AssetTranslationState | undefined;
+  const inflightSync = new Set<number>();
+  const pendingTextUploadKey = "pending_text_upload_ids";
+
+  const loadPendingTextIds = (): number[] => {
+    try {
+      const raw = localStorage.getItem(pendingTextUploadKey);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value) && value > 0);
+    } catch {
+      return [];
+    }
+  };
+
+  const savePendingTextIds = (ids: number[]) => {
+    localStorage.setItem(pendingTextUploadKey, JSON.stringify(ids));
+  };
+
+  const formatTextBatchFileName = () => {
+    const now = new Date();
+    const pad = (v: number) => String(v).padStart(2, "0");
+    const yyyy = now.getFullYear();
+    const mm = pad(now.getMonth() + 1);
+    const dd = pad(now.getDate());
+    const hh = pad(now.getHours());
+    const mi = pad(now.getMinutes());
+    const ss = pad(now.getSeconds());
+    return `${yyyy}${mm}${dd}_${hh}${mi}${ss}_note.txt`;
+  };
+
+  const buildBatchText = (items: ClipboardHistoryItem[]) => {
+    const lines: string[] = [];
+    for (const item of items) {
+      lines.push(`===== id=${item.id} kind=${item.kind} created_at=${formatTime(item.created_at_ms)} =====`);
+      lines.push(item.value ?? "");
+      lines.push("");
+    }
+    return lines.join("\n");
+  };
+
+  const flushTextUploadQueue = async () => {
+    const authState = authStore.getState();
+    if (!authState.onlineMode || !authState.isLoggedIn) return;
+
+    let batchSize = 50;
+    try {
+      batchSize = await invoke<number>("get_text_upload_batch_size");
+    } catch {}
+
+    let ids = loadPendingTextIds();
+    if (ids.length < batchSize) return;
+
+    // 只处理前 batchSize 条，避免一次上传过大；剩余的下一轮再处理
+    const current = ids.slice(0, batchSize);
+    const rest = ids.slice(batchSize);
+
+    const items = current
+      .map((id) => history.find((candidate) => candidate.id === id))
+      .filter((value): value is ClipboardHistoryItem => Boolean(value));
+
+    if (items.length === 0) {
+      savePendingTextIds(rest);
+      return;
+    }
+
+    try {
+      const response = await apiClient.textUpload({
+        text: buildBatchText(items),
+        file_name: formatTextBatchFileName(),
+      });
+      const fileId = (response as { file_id?: string }).file_id ?? null;
+      for (const item of items) {
+        await invoke("update_history_upload_state", {
+          id: item.id,
+          uploadState: "uploaded",
+          remoteFileId: fileId,
+          overview: null,
+          extractedText: null,
+        });
+      }
+      savePendingTextIds(rest);
+    } catch (error) {
+      console.error("[text_upload] failed", error);
+      // 失败：把这一批标记为 failed，并从队列里移除，允许用户重试
+      for (const item of items) {
+        await invoke("update_history_upload_state", {
+          id: item.id,
+          uploadState: "failed",
+          remoteFileId: null,
+          overview: null,
+          extractedText: null,
+        }).catch(() => {});
+      }
+      savePendingTextIds(rest);
+    }
+
+    // 如果剩余仍满足阈值，继续 flush
+    if (loadPendingTextIds().length >= batchSize) {
+      await flushTextUploadQueue();
+    }
+  };
+
+  const blobFromDataUrl = (dataUrl: string): { blob: Blob; mimeType: string; fileName: string } | null => {
+    const match = dataUrl.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.*)$/s);
+    if (!match) return null;
+    const mimeType = match[1] || "application/octet-stream";
+    const base64 = match[2] || "";
+    const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+    return { blob: new Blob([bytes], { type: mimeType }), mimeType, fileName: "file" };
+  };
+
+  const syncHistoryItem = async (item: ClipboardHistoryItem): Promise<void> => {
+    if (!item.id) return;
+    const authState = authStore.getState();
+    if (!authState.onlineMode || !authState.isLoggedIn) return;
+    const state = normalizedUploadState(item);
+    if (state === "uploaded" || state === "uploading") return;
+    if (inflightSync.has(item.id)) return;
+    inflightSync.add(item.id);
+    try {
+      // 文本类型素材：不逐条上传。先加入待上传队列，达到阈值后合并上传。
+      if (item.kind !== "image" && item.kind !== "file") {
+        await invoke("update_history_upload_state", {
+          id: item.id,
+          uploadState: "uploading",
+          remoteFileId: null,
+          overview: null,
+          extractedText: null,
+        });
+        const ids = loadPendingTextIds();
+        if (!ids.includes(item.id)) {
+          ids.push(item.id);
+          savePendingTextIds(ids);
+        }
+        await flushTextUploadQueue();
+        return;
+      }
+
+      await invoke("update_history_upload_state", {
+        id: item.id,
+        uploadState: "uploading",
+        remoteFileId: null,
+        overview: null,
+        extractedText: null,
+      });
+
+      let blob: Blob;
+      let fileName: string;
+      let mimeType: string | null = null;
+      if (item.kind === "image" || item.kind === "file") {
+        const dataUrl = await invoke<string | null>("read_file_data_url", { value: item.value });
+        if (!dataUrl) throw new Error("读取文件失败");
+        const parsed = blobFromDataUrl(dataUrl);
+        if (!parsed) throw new Error("文件格式解析失败");
+        blob = parsed.blob;
+        mimeType = parsed.mimeType;
+        fileName = basenameOf(item.value) || "file";
+      } else {
+        blob = new Blob([item.value], { type: "text/plain" });
+        fileName = item.kind === "note" ? `note-${item.id}.txt` : `text-${item.id}.txt`;
+        mimeType = "text/plain";
+      }
+
+      const result = await apiClient.fileReader(blob, fileName, mimeType, { aiSummary: true });
+      await invoke("update_history_upload_state", {
+        id: item.id,
+        uploadState: "uploaded",
+        remoteFileId: result.file_id ?? null,
+        overview: result.summary ?? "",
+        extractedText: result.text ?? "",
+      });
+    } catch (error) {
+      console.error("[sync] failed", error);
+      await invoke("update_history_upload_state", {
+        id: item.id,
+        uploadState: "failed",
+        remoteFileId: null,
+        overview: null,
+        extractedText: null,
+      }).catch(() => {});
+    } finally {
+      inflightSync.delete(item.id);
+    }
+  };
+
+  const syncById = (id: number) => {
+    const target = history.find((candidate) => candidate.id === id);
+    if (!target) return;
+    void syncHistoryItem(target);
+  };
 
   const currentAssets = () => filteredAssets(history, activeAssetFilter, searchQuery);
   const currentNotes = () => filteredNotes(history, searchQuery);
@@ -1570,6 +1931,40 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
       : transientAsset
         ? assetSelectionFromPayload(transientAsset)
         : undefined;
+    const activeTranslation =
+      selection && assetTranslation?.key === assetTranslationKey(selection) ? assetTranslation : undefined;
+    const translate =
+      selection && (selection.kind === "text" || selection.kind === "web")
+        ? () => {
+            const source = (selection.content ?? "").trim();
+            if (!source) return;
+            const key = assetTranslationKey(selection);
+            assetTranslation = { key, source, status: "loading" };
+            render();
+            void apiClient
+              .translateText({ text: source })
+              .then((result) => {
+                if (assetTranslation?.key !== key) return;
+                assetTranslation = {
+                  key,
+                  source,
+                  status: "success",
+                  translatedText: result.translated_text ?? "",
+                };
+                render();
+              })
+              .catch((error: unknown) => {
+                if (assetTranslation?.key !== key) return;
+                assetTranslation = {
+                  key,
+                  source,
+                  status: "error",
+                  error: `翻译失败：${error instanceof Error ? error.message : String(error)}`,
+                };
+                render();
+              });
+          }
+        : undefined;
     renderAssetDetail(
       assetsDetail,
       selection,
@@ -1582,6 +1977,9 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
       selection?.id
         ? () => invoke("delete_clipboard_history_item", { id: selection.id }).catch(() => {})
         : undefined,
+      activeTranslation,
+      translate,
+      selection?.id ? () => syncById(selection.id!) : undefined,
     );
   };
 
@@ -1647,6 +2045,7 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
       selection?.id
         ? () => invoke("delete_clipboard_history_item", { id: selection.id }).catch(() => {})
         : undefined,
+      selection?.id ? () => syncById(selection.id!) : undefined,
       selection
         ? (title: string, text: string) => {
             const hasAny = Boolean(title.trim() || text.trim());
@@ -1831,7 +2230,19 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
     if (event.payload.kind !== "note" && selectedAssetId === undefined) {
       selectedAssetId = event.payload.id;
     }
+    // 自动同步：仅在用户开启开关且处于在线登录状态时触发
+    void invoke<boolean>("get_auto_sync")
+      .then((enabled) => {
+        if (!enabled) return;
+        void syncHistoryItem(event.payload);
+      })
+      .catch(() => {});
     render();
+  });
+
+  // 重新登录或 token 刷新后，尝试把已积累的文本队列继续 flush（如果达到阈值）
+  window.addEventListener("auth-refreshed", () => {
+    void flushTextUploadQueue();
   });
 
   await appWindow.listen("history-cleared", () => {

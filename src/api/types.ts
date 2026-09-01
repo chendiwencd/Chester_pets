@@ -123,6 +123,17 @@ export interface TranslationResponse {
   note?: string | null;
 }
 
+export interface TextUploadRequest {
+  text: string;
+  file_name: string;
+}
+
+// 后端可能返回 message / file_id 等字段；这里保持宽松，避免 schema 轻微变化导致前端崩溃。
+export interface TextUploadResponse {
+  message?: string;
+  file_id?: string;
+}
+
 export interface FileReaderDocument {
   page_content: string;
   metadata: Record<string, unknown>;
