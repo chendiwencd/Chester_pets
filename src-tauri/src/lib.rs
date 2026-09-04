@@ -1,3 +1,4 @@
+mod client_actions;
 mod clipboard;
 mod commands;
 mod db;
@@ -73,6 +74,19 @@ pub fn run() {
         .manage(state::AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::add_text_history_item,
+            client_actions::client_action_focus_window,
+            client_actions::client_action_get_active_window,
+            client_actions::client_action_get_display_info,
+            client_actions::client_action_get_network_status,
+            client_actions::client_action_get_os_info,
+            client_actions::client_action_open_calendar_ics,
+            client_actions::client_action_launch_app,
+            client_actions::client_action_list_windows,
+            client_actions::client_action_open_settings,
+            client_actions::client_action_open_url,
+            client_actions::client_action_search_web,
+            client_actions::client_action_set_clipboard_text,
+            client_actions::client_actions_list_tools,
             commands::create_note_history_item,
             commands::clear_clipboard_history,
             commands::copy_text_to_clipboard,

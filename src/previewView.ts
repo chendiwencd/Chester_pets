@@ -1,7 +1,18 @@
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { apiClient } from "./api/authClient";
+import type {
+  DesktopActionRead,
+  DesktopAgentDocumentEvent,
+  DesktopAgentInvokeResponse,
+  DesktopDocumentRead,
+} from "./api/types";
 import { authStore } from "./authStore";
+import {
+  DESKTOP_TOOL_CAPABILITIES,
+  createDesktopClientContext,
+  executeDesktopAction,
+} from "./clientActions";
 import { resolveImageSrc } from "./media";
 import { createWorkspaceIcon, type WorkspaceIconName } from "./workspaceIcons";
 import { initWorkspaceSettingsPage } from "./workspaceSettingsPage";
@@ -14,6 +25,7 @@ const NOTE_RESOURCE_MARKER = "[[desktop-shell:resources:v1]]";
 const LAST_ASSET_KEY = "desktop-shell.workspace.last-asset-id";
 const LAST_NOTE_KEY = "desktop-shell.workspace.last-note-id";
 const NOTE_ORDER_KEY = "desktop-shell.workspace.note-order";
+const ASSISTANT_PLACEHOLDER = "正在打开 Agent...";
 
 interface PanelContentPayload {
   id?: number;
@@ -37,7 +49,7 @@ interface ClipboardHistoryItem {
 type UploadState = "not_uploaded" | "uploading" | "uploaded" | "failed";
 
 interface SavedResourceSummary {
-  id?: number; // 资源的 history item id
+  id?: number; // 璧勬簮鐨?history item id
   kind: "text" | "image" | "file";
   name: string;
   summary: string;
@@ -81,6 +93,20 @@ interface NoteSelection {
   uploadState?: UploadState;
   remoteFileId?: string | null;
 }
+
+interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  documents?: DesktopDocumentRead[];
+  actions?: DesktopActionRead[];
+  error?: boolean;
+}
+
+type ChatDrawerState =
+  | { kind: "closed" }
+  | { kind: "tools" }
+  | { kind: "document"; document: DesktopDocumentRead; citationIndex: number };
 
 function normalizedUploadState(item: ClipboardHistoryItem): UploadState {
   const state = item.upload_state;
@@ -661,9 +687,9 @@ function renderAssetDetail(
     uploadPill.textContent =
       uploadState === "uploaded"
         ? "已上传"
-        : uploadState === "uploading"
+          : uploadState === "uploading"
           ? "上传中"
-          : uploadState === "failed"
+            : uploadState === "failed"
             ? "上传失败"
             : "未上传";
     badges.appendChild(uploadPill);
@@ -970,8 +996,8 @@ function renderNotebookDetail(
     const closeBtn = document.createElement("button");
     closeBtn.className = "workspace-icon-button";
     closeBtn.type = "button";
-    closeBtn.setAttribute("aria-label", "关闭");
-    closeBtn.title = "关闭";
+  closeBtn.setAttribute("aria-label", "关闭");
+  closeBtn.title = "关闭";
     closeBtn.appendChild(createWorkspaceIcon("x", "workspace-inline-icon"));
     closeBtn.addEventListener("click", () => {
       drawerMaterial = undefined;
@@ -1092,9 +1118,9 @@ function renderNotebookDetail(
       uploadPill.textContent =
         uploadState === "uploaded"
           ? "已上传"
-          : uploadState === "uploading"
+            : uploadState === "uploading"
             ? "上传中"
-            : uploadState === "failed"
+              : uploadState === "failed"
               ? "上传失败"
               : "未上传";
       badges.appendChild(uploadPill);
@@ -1554,7 +1580,7 @@ function renderNotebookDetail(
       const copyButton = document.createElement("button");
       copyButton.type = "button";
       copyButton.className = "workspace-action-button";
-      copyButton.textContent = "复制";
+            copyButton.textContent = "复制";
       copyButton.addEventListener("click", () => onCopy?.());
       const deleteButton = document.createElement("button");
       deleteButton.type = "button";
@@ -1564,7 +1590,7 @@ function renderNotebookDetail(
       footer.append(copyButton, deleteButton);
       root.appendChild(footer);
     }
-
+    
     // 抽屉（默认关闭；点击 mention 时打开）
     const { drawer } = ensureDrawer();
     if (drawerMaterial) {
@@ -1578,25 +1604,611 @@ function renderNotebookDetail(
   render();
 }
 
-function renderStaticChat(feedRoot: HTMLElement, toolbarRoot: HTMLElement): void {
+function createDesktopThreadId(): string {
+  if (globalThis.crypto?.randomUUID) {
+    return `desktop-${globalThis.crypto.randomUUID()}`;
+  }
+  return `desktop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function isDesktopActionRead(value: unknown): value is DesktopActionRead {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.action_id === "string" &&
+    typeof value.thread_id === "string" &&
+    typeof value.tool_name === "string" &&
+    isRecord(value.arguments) &&
+    typeof value.display_text === "string" &&
+    typeof value.risk_level === "string" &&
+    typeof value.requires_confirmation === "boolean" &&
+    typeof value.status === "string"
+  );
+}
+
+function collectDesktopActions(value: unknown): DesktopActionRead[] {
+  if (isDesktopActionRead(value)) return [value];
+  if (Array.isArray(value)) return value.flatMap(collectDesktopActions);
+  if (!isRecord(value)) return [];
+  const candidates = [
+    value.action,
+    value.actions,
+    value.desktop_action,
+    value.desktop_actions,
+    value.proposed_action,
+    value.proposed_actions,
+    value.tool_call,
+    value.tool_calls,
+  ];
+  return candidates.flatMap(collectDesktopActions);
+}
+
+function isDesktopDocumentRead(value: unknown): value is DesktopDocumentRead {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.file_id === "string" &&
+    typeof value.file_name === "string" &&
+    typeof value.chunk_id === "string" &&
+    typeof value.chunk_index === "number" &&
+    Number.isInteger(value.chunk_index) &&
+    typeof value.content === "string" &&
+    isRecord(value.metadata) &&
+    typeof value.score === "number"
+  );
+}
+
+function collectDesktopDocuments(value: unknown): DesktopDocumentRead[] {
+  if (isDesktopDocumentRead(value)) return [value];
+  if (Array.isArray(value)) return value.flatMap(collectDesktopDocuments);
+  if (!isRecord(value)) return [];
+  const candidates = [
+    value.document,
+    value.documents,
+    value.desktop_document,
+    value.desktop_documents,
+    value.chunk,
+    value.chunks,
+  ];
+  return candidates.flatMap(collectDesktopDocuments);
+}
+
+const ACTION_STATUS_PRIORITY: Record<DesktopActionRead["status"], number> = {
+  proposed: 0,
+  approved: 1,
+  cancelled: 2,
+  error: 3,
+  success: 4,
+};
+
+function mergeDesktopActions(
+  existing: DesktopActionRead[] | undefined,
+  incoming: DesktopActionRead[],
+): DesktopActionRead[] {
+  const merged = new Map<string, DesktopActionRead>();
+  for (const action of existing ?? []) {
+    merged.set(action.action_id, action);
+  }
+  for (const action of incoming) {
+    const previous = merged.get(action.action_id);
+    if (!previous) {
+      merged.set(action.action_id, action);
+      continue;
+    }
+    const previousRank = ACTION_STATUS_PRIORITY[previous.status];
+    const nextRank = ACTION_STATUS_PRIORITY[action.status];
+    merged.set(action.action_id, nextRank >= previousRank ? { ...previous, ...action } : previous);
+  }
+  return [...merged.values()];
+}
+
+function documentKey(document: DesktopDocumentRead): string {
+  return `${document.file_id}:${document.chunk_id}`;
+}
+
+function mergeDesktopDocuments(
+  existing: DesktopDocumentRead[] | undefined,
+  incoming: DesktopDocumentRead[],
+): DesktopDocumentRead[] {
+  const merged = new Map<string, DesktopDocumentRead>();
+  for (const document of existing ?? []) {
+    merged.set(documentKey(document), document);
+  }
+  for (const document of incoming) {
+    merged.set(documentKey(document), document);
+  }
+  return [...merged.values()];
+}
+
+function responseText(value: DesktopAgentInvokeResponse): string {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  const keys = ["output_text", "message", "answer", "display_text", "text", "content", "response"];
+  if (isRecord(value)) {
+    for (const key of keys) {
+      const next = value[key];
+      if (typeof next === "string" && next.trim()) return next.trim();
+    }
+  }
+  const documents = collectDesktopDocuments(value);
+  if (documents.length > 0) {
+    return `已返回 ${documents.length} 条引用`;
+  }
+  const actions = collectDesktopActions(value);
+  if (actions.length > 0) {
+    return actions.map((action) => action.display_text || action.reason || action.tool_name).join("\n");
+  }
+  return JSON.stringify(value, null, 2) ?? String(value);
+}
+
+interface MarkdownRenderContext {
+  documents: DesktopDocumentRead[];
+  onCitationClick?: (document: DesktopDocumentRead, citationIndex: number) => void;
+  activeDocument?: DesktopDocumentRead;
+}
+
+function isSafeMarkdownUrl(value: string): boolean {
+  try {
+    const url = new URL(value, window.location.origin);
+    return ["http:", "https:", "mailto:", "tel:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+}
+
+function appendMarkdownInline(root: HTMLElement, text: string, context: MarkdownRenderContext): void {
+  let index = 0;
+  while (index < text.length) {
+    const remaining = text.slice(index);
+    const citationMatch = remaining.match(/^\[(\d+)\]/);
+    if (citationMatch) {
+      const citationIndex = Number(citationMatch[1]);
+      const doc = context.documents[citationIndex - 1];
+      if (doc) {
+        const citation = document.createElement("button");
+        citation.type = "button";
+        citation.className = "workspace-chat-citation";
+        if (
+          context.activeDocument &&
+          context.activeDocument.file_id === doc.file_id &&
+          context.activeDocument.chunk_id === doc.chunk_id
+        ) {
+          citation.classList.add("is-active");
+        }
+        citation.textContent = citationMatch[0];
+        citation.title = "打开引用 " + citationIndex;
+        citation.addEventListener("click", () => context.onCitationClick?.(doc, citationIndex));
+        root.appendChild(citation);
+        index += citationMatch[0].length;
+        continue;
+      }
+    }
+
+    if (remaining.startsWith("**")) {
+      const endIndex = text.indexOf("**", index + 2);
+      if (endIndex > index + 2) {
+        const strong = document.createElement("strong");
+        appendMarkdownInline(strong, text.slice(index + 2, endIndex), context);
+        root.appendChild(strong);
+        index = endIndex + 2;
+        continue;
+      }
+    }
+
+    if (remaining.startsWith("*")) {
+      const endIndex = text.indexOf("*", index + 1);
+      if (endIndex > index + 1) {
+        const em = document.createElement("em");
+        appendMarkdownInline(em, text.slice(index + 1, endIndex), context);
+        root.appendChild(em);
+        index = endIndex + 1;
+        continue;
+      }
+    }
+
+    if (remaining.startsWith("`")) {
+      const endIndex = text.indexOf("`", index + 1);
+      if (endIndex > index + 1) {
+        const code = document.createElement("code");
+        code.textContent = text.slice(index + 1, endIndex);
+        root.appendChild(code);
+        index = endIndex + 1;
+        continue;
+      }
+    }
+
+    if (remaining.startsWith("[")) {
+      const linkMatch = remaining.match(/^\[([^\]\n]+)\]\(([^)\s]+)\)/);
+      if (linkMatch) {
+        if (isSafeMarkdownUrl(linkMatch[2])) {
+          const link = document.createElement("a");
+          link.href = linkMatch[2];
+          link.target = "_blank";
+          link.rel = "noreferrer";
+          link.textContent = linkMatch[1];
+          root.appendChild(link);
+        } else {
+          root.appendChild(document.createTextNode(linkMatch[0]));
+        }
+        index += linkMatch[0].length;
+        continue;
+      }
+    }
+
+    let next = text.length;
+    for (const marker of ["[", "*", "`"]) {
+      const markerIndex = text.indexOf(marker, index);
+      if (markerIndex >= 0 && markerIndex < next) {
+        next = markerIndex;
+      }
+    }
+    if (next <= index) {
+      next = index + 1;
+    }
+    root.appendChild(document.createTextNode(text.slice(index, next)));
+    index = next;
+  }
+}
+
+function renderMarkdownText(
+  root: HTMLElement,
+  text: string,
+  context: MarkdownRenderContext,
+): void {
+  root.innerHTML = "";
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  let paragraphLines: string[] = [];
+  let quoteLines: string[] = [];
+  let codeLines: string[] | null = null;
+  let listKind: "ul" | "ol" | null = null;
+  let listItems: string[] = [];
+
+  const flushParagraph = () => {
+    if (!paragraphLines.length) return;
+    const paragraph = document.createElement("p");
+    appendMarkdownInline(paragraph, paragraphLines.join(" "), context);
+    root.appendChild(paragraph);
+    paragraphLines = [];
+  };
+
+  const flushQuote = () => {
+    if (!quoteLines.length) return;
+    const quote = document.createElement("blockquote");
+    appendMarkdownInline(quote, quoteLines.join(" "), context);
+    root.appendChild(quote);
+    quoteLines = [];
+  };
+
+  const flushCode = () => {
+    if (!codeLines) return;
+    const pre = document.createElement("pre");
+    const code = document.createElement("code");
+    code.textContent = codeLines.join("\n");
+    pre.appendChild(code);
+    root.appendChild(pre);
+    codeLines = null;
+  };
+
+  const flushList = () => {
+    if (!listKind) return;
+    const list = document.createElement(listKind);
+    for (const itemText of listItems) {
+      const item = document.createElement("li");
+      appendMarkdownInline(item, itemText, context);
+      list.appendChild(item);
+    }
+    root.appendChild(list);
+    listKind = null;
+    listItems = [];
+  };
+
+  for (const line of lines) {
+    const fenceMatch = line.match(/^```(.*)$/);
+    if (fenceMatch) {
+      if (codeLines) {
+        flushCode();
+      } else {
+        flushParagraph();
+        flushQuote();
+        flushList();
+        codeLines = [];
+      }
+      continue;
+    }
+
+    if (codeLines) {
+      codeLines.push(line);
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushParagraph();
+      flushQuote();
+      flushList();
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,3})\s+(.*)$/);
+    if (headingMatch) {
+      flushParagraph();
+      flushQuote();
+      flushList();
+      const headingTag = "h" + headingMatch[1].length;
+      const heading = document.createElement(headingTag);
+      appendMarkdownInline(heading, headingMatch[2], context);
+      root.appendChild(heading);
+      continue;
+    }
+
+    const quoteMatch = line.match(/^>\s?(.*)$/);
+    if (quoteMatch) {
+      flushParagraph();
+      flushList();
+      quoteLines.push(quoteMatch[1]);
+      continue;
+    }
+
+    if (quoteLines.length) {
+      flushQuote();
+    }
+
+    const unorderedMatch = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (unorderedMatch) {
+      flushParagraph();
+      if (listKind !== "ul") {
+        flushList();
+        listKind = "ul";
+        listItems = [];
+      }
+      listItems.push(unorderedMatch[1]);
+      continue;
+    }
+
+    const orderedMatch = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (orderedMatch) {
+      flushParagraph();
+      if (listKind !== "ol") {
+        flushList();
+        listKind = "ol";
+        listItems = [];
+      }
+      listItems.push(orderedMatch[1]);
+      continue;
+    }
+
+    if (listKind) {
+      flushList();
+    }
+
+    paragraphLines.push(line.trim());
+  }
+
+  flushParagraph();
+  flushQuote();
+  flushList();
+  flushCode();
+}
+
+function renderChatMessageText(
+  root: HTMLElement,
+  message: ChatMessage,
+  onCitationClick?: (document: DesktopDocumentRead, citationIndex: number) => void,
+  activeDocument?: DesktopDocumentRead,
+): void {
+  renderMarkdownText(root, message.text || "", {
+    documents: message.documents ?? [],
+    onCitationClick,
+    activeDocument,
+  });
+}
+
+function renderChatMessage(
+  root: HTMLElement,
+  message: ChatMessage,
+  onCitationClick?: (document: DesktopDocumentRead, citationIndex: number) => void,
+  activeDocument?: DesktopDocumentRead,
+): void {
+  const row = document.createElement("div");
+  row.className = `workspace-chat-row is-${message.role === "user" ? "outgoing" : "incoming"}`;
+
+  const bubble = document.createElement("div");
+  bubble.className = `workspace-chat-bubble is-${message.role === "user" ? "outgoing" : "incoming"}`;
+  if (message.error) bubble.classList.add("is-error");
+
+  const text = document.createElement("div");
+  text.className = "workspace-chat-message-text";
+  renderChatMessageText(text, message, onCitationClick, activeDocument);
+  bubble.appendChild(text);
+
+  if (message.actions?.length) {
+    const actions = document.createElement("div");
+    actions.className = "workspace-chat-action-list";
+    for (const action of message.actions) {
+      const item = document.createElement("article");
+      item.className = "workspace-chat-action-card";
+      item.dataset.risk = action.risk_level;
+      item.dataset.status = action.status;
+
+      const title = document.createElement("div");
+      title.className = "workspace-chat-action-title";
+      title.textContent = action.tool_name;
+      const body = document.createElement("div");
+      body.className = "workspace-chat-action-body";
+      body.textContent = action.reason || action.display_text;
+      const meta = document.createElement("div");
+      meta.className = "workspace-chat-action-meta";
+      meta.textContent = `${action.status} / ${action.risk_level}${action.requires_confirmation ? " / confirm" : ""}`;
+      const args = document.createElement("pre");
+      args.className = "workspace-chat-action-args";
+      args.textContent = JSON.stringify(action.arguments, null, 2);
+
+      item.append(title, body, meta, args);
+      if (action.error_message) {
+        const error = document.createElement("div");
+        error.className = "workspace-chat-action-error";
+        error.textContent = action.error_message;
+        item.appendChild(error);
+      }
+      actions.appendChild(item);
+    }
+    bubble.appendChild(actions);
+  }
+
+  row.appendChild(bubble);
+  root.appendChild(row);
+}
+
+function renderToolCapabilityList(root: HTMLElement): void {
+  root.innerHTML = "";
+
+  const panel = document.createElement("section");
+  panel.className = "workspace-tool-panel";
+
+  const list = document.createElement("div");
+  list.className = "workspace-tool-capability-list";
+  for (const capability of DESKTOP_TOOL_CAPABILITIES) {
+    const item = document.createElement("article");
+    item.className = "workspace-tool-capability";
+    item.dataset.risk = capability.risk_level;
+
+    const main = document.createElement("div");
+    main.className = "workspace-tool-capability-main";
+    const name = document.createElement("div");
+    name.className = "workspace-tool-capability-name";
+    name.textContent = capability.label_name;
+    const description = document.createElement("div");
+    description.className = "workspace-tool-capability-desc";
+    description.textContent = capability.label_description;
+    main.append(name, description);
+
+    const meta = document.createElement("div");
+    meta.className = "workspace-tool-capability-meta";
+    const risk = document.createElement("span");
+    risk.className = `workspace-tool-risk is-${capability.risk_level}`;
+    risk.textContent = capability.risk_level;
+    meta.appendChild(risk);
+    if (capability.requires_confirmation) {
+      const confirm = document.createElement("span");
+      confirm.className = "workspace-tool-confirm";
+      confirm.textContent = "confirm";
+      meta.appendChild(confirm);
+    }
+
+    item.append(main, meta);
+    list.appendChild(item);
+  }
+
+  panel.append(list);
+  root.appendChild(panel);
+}
+
+function renderChatDrawer(
+  root: HTMLElement,
+  drawerState: ChatDrawerState,
+  onClose: () => void,
+): void {
+  root.innerHTML = "";
+  root.classList.toggle("is-open", drawerState.kind !== "closed");
+  root.setAttribute("aria-hidden", drawerState.kind === "closed" ? "true" : "false");
+
+  if (drawerState.kind === "closed") return;
+
+  const backdrop = document.createElement("button");
+  backdrop.type = "button";
+  backdrop.className = "workspace-chat-drawer-backdrop";
+  backdrop.setAttribute("aria-label", "关闭抽屉");
+  backdrop.addEventListener("click", onClose);
+
+  const sheet = document.createElement("section");
+  sheet.className = "workspace-chat-drawer-sheet";
+
+  const header = document.createElement("div");
+  header.className = "workspace-chat-drawer-header";
+  const titleWrap = document.createElement("div");
+  titleWrap.className = "workspace-chat-drawer-header-copy";
+  const kicker = document.createElement("div");
+  kicker.className = "workspace-kicker";
+  kicker.textContent = drawerState.kind === "tools" ? "工具" : `引用 ${drawerState.citationIndex}`;
+  const title = document.createElement("div");
+  title.className = "workspace-chat-drawer-title";
+  title.textContent =
+    drawerState.kind === "tools" ? "工具能力" : drawerState.document.file_name;
+  titleWrap.append(kicker, title);
+
+  const closeBtn = document.createElement("button");
+  closeBtn.type = "button";
+  closeBtn.className = "workspace-icon-button";
+  closeBtn.setAttribute("aria-label", "关闭");
+  closeBtn.title = "关闭";
+  closeBtn.appendChild(createWorkspaceIcon("x", "workspace-inline-icon"));
+  closeBtn.addEventListener("click", onClose);
+  header.append(titleWrap, closeBtn);
+
+  const body = document.createElement("div");
+  body.className = "workspace-chat-drawer-body";
+
+  if (drawerState.kind === "tools") {
+    renderToolCapabilityList(body);
+  } else {
+    const meta = document.createElement("div");
+    meta.className = "workspace-chat-drawer-meta";
+    meta.textContent = `chunk ${drawerState.document.chunk_index}`;
+
+    const content = document.createElement("pre");
+    content.className = "workspace-chat-drawer-content";
+    content.textContent = drawerState.document.content;
+
+    body.append(meta, content);
+  }
+
+  sheet.append(header, body);
+  root.append(backdrop, sheet);
+}
+
+function renderStaticChat(
+  feedRoot: HTMLElement,
+  toolbarRoot: HTMLElement,
+  resourcesRoot: HTMLElement,
+  messages: ChatMessage[],
+  sending: boolean,
+  drawerState: ChatDrawerState,
+  onToggleTools: () => void,
+  onOpenDocument: (document: DesktopDocumentRead, citationIndex: number) => void,
+  onCloseDrawer: () => void,
+): void {
   feedRoot.innerHTML = "";
   toolbarRoot.innerHTML = "";
 
   const outgoingWrap = document.createElement("div");
-  outgoingWrap.className = "workspace-chat-row is-outgoing";
-  const outgoing = document.createElement("div");
-  outgoing.className = "workspace-chat-bubble is-outgoing";
-  outgoing.textContent = "修复发送区域，工具栏使用图标替代。";
-  outgoingWrap.appendChild(outgoing);
+
 
   const incomingWrap = document.createElement("div");
   incomingWrap.className = "workspace-chat-row is-incoming";
   const incoming = document.createElement("div");
   incoming.className = "workspace-chat-bubble is-incoming";
-  incoming.textContent = "已把发送区域重构为稳定输入面板，并将工具栏从文字标签改成图标按钮，减轻视觉噪音。";
+    incoming.textContent = "输入你的需求： 打开软件？ 搜索你的工作区？";
   incomingWrap.appendChild(incoming);
 
   feedRoot.append(outgoingWrap, incomingWrap);
+  if (messages.length > 0 || sending) {
+    feedRoot.innerHTML = "";
+    for (const message of messages) {
+      renderChatMessage(
+        feedRoot,
+        message,
+        onOpenDocument,
+        drawerState.kind === "document" ? drawerState.document : undefined,
+      );
+    }
+    if (sending && messages.length === 0) {
+      renderChatMessage(feedRoot, {
+        id: "pending",
+        role: "assistant",
+        text: ASSISTANT_PLACEHOLDER,
+      });
+    }
+  }
 
   const tools: Array<{ name: WorkspaceIconName; label: string }> = [
     { name: "paperclip", label: "添加素材" },
@@ -1606,14 +2218,23 @@ function renderStaticChat(feedRoot: HTMLElement, toolbarRoot: HTMLElement): void
     { name: "list-todo", label: "查看任务" },
   ];
   for (const tool of tools) {
+    const isToolsButton = tool.name === "plug-zap";
     const button = document.createElement("button");
     button.type = "button";
     button.className = "workspace-tool-button";
+    if (isToolsButton && drawerState.kind === "tools") button.classList.add("is-active");
     button.setAttribute("aria-label", tool.label);
+    if (isToolsButton) {
+      button.setAttribute("aria-controls", "workspace-chat-resources");
+      button.setAttribute("aria-expanded", String(drawerState.kind === "tools"));
+      button.addEventListener("click", onToggleTools);
+    }
     button.title = tool.label;
     button.appendChild(createWorkspaceIcon(tool.name, "workspace-inline-icon workspace-icon-tool"));
     toolbarRoot.appendChild(button);
   }
+
+  renderChatDrawer(resourcesRoot, drawerState, onCloseDrawer);
 }
 
 
@@ -1641,6 +2262,7 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   const chatFeed = document.getElementById("workspace-chat-feed");
   const chatToolbar = document.getElementById("workspace-chat-toolbar");
   const chatResources = document.getElementById("workspace-chat-resources");
+  const chatInput = document.getElementById("workspace-chat-input") as HTMLTextAreaElement | null;
   const chatSubmit = document.getElementById("workspace-chat-submit");
 
   let history: ClipboardHistoryItem[] = [];
@@ -1650,6 +2272,11 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   let selectedAssetId: number | undefined;
   let selectedNoteId: number | undefined;
   let notebookManageMode = false;
+  let chatDrawerState: ChatDrawerState = { kind: "closed" };
+  let chatDraft = "";
+  let chatSending = false;
+  let chatMessages: ChatMessage[] = [];
+  const executingDesktopActions = new Set<string>();
   let transientAsset: PanelContentPayload | undefined;
   let transientNote: PanelContentPayload | undefined;
   let notebookEditor:
@@ -1848,6 +2475,255 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
     const target = history.find((candidate) => candidate.id === id);
     if (!target) return;
     void syncHistoryItem(target);
+  };
+
+  const upsertChatAssistantMessage = (
+    threadId: string,
+    updater: (message: ChatMessage) => ChatMessage,
+  ) => {
+    const index = chatMessages.findIndex(
+      (message) => message.id === threadId && message.role === "assistant",
+    );
+    const baseMessage: ChatMessage =
+      index >= 0
+        ? chatMessages[index]
+        : {
+            id: threadId,
+            role: "assistant",
+            text: "",
+          };
+    const nextMessage = updater(baseMessage);
+    if (index >= 0) {
+      chatMessages = [...chatMessages.slice(0, index), nextMessage, ...chatMessages.slice(index + 1)];
+    } else {
+      chatMessages = [...chatMessages, nextMessage];
+    }
+  };
+
+  const upsertChatAssistantAction = (threadId: string, action: DesktopActionRead) => {
+    upsertChatAssistantMessage(threadId, (message) => ({
+      ...message,
+      actions: mergeDesktopActions(message.actions, [action]),
+    }));
+  };
+
+  const upsertChatAssistantDocument = (threadId: string, document: DesktopAgentDocumentEvent) => {
+    upsertChatAssistantMessage(threadId, (message) => ({
+      ...message,
+      documents: mergeDesktopDocuments(message.documents, [document]),
+      text: message.text || "",
+    }));
+  };
+
+  const updateChatAssistantText = (
+    threadId: string,
+    text: string,
+    mode: "replace" | "append" = "replace",
+    error = false,
+  ) => {
+    upsertChatAssistantMessage(threadId, (message) => {
+      const baseText = message.text === ASSISTANT_PLACEHOLDER ? "" : message.text;
+      return {
+        ...message,
+        text: mode === "append" ? baseText + text : text,
+        error,
+      };
+    });
+  };
+  const updateChatAssistantAction = (
+    threadId: string,
+    actionId: string,
+    updater: (action: DesktopActionRead) => DesktopActionRead,
+  ) => {
+    upsertChatAssistantMessage(threadId, (message) => {
+      if (!message.actions?.length) return message;
+      const actions = message.actions.map((action) =>
+        action.action_id === actionId ? updater(action) : action,
+      );
+      return {
+        ...message,
+        actions: mergeDesktopActions(actions, []),
+      };
+    });
+  };
+
+  const scrollChatToBottom = () => {
+    requestAnimationFrame(() => {
+      if (chatFeed instanceof HTMLElement) {
+        chatFeed.scrollTop = chatFeed.scrollHeight;
+      }
+    });
+  };
+
+  const reportDesktopActionOutcome = async (
+    action: DesktopActionRead,
+    outcome: { status: "success" | "error" | "cancelled"; data?: Record<string, unknown>; error_message?: string },
+  ) => {
+    try {
+      const reported = await apiClient.reportDesktopActionResult(action.action_id, {
+        status: outcome.status,
+        data: outcome.data,
+        error_message: outcome.error_message ?? null,
+      });
+      if (reported.thread_id === action.thread_id) {
+        updateChatAssistantAction(action.thread_id, action.action_id, () => reported);
+        render();
+        scrollChatToBottom();
+      }
+    } catch (error) {
+      console.warn("[desktop_action] failed to report result", error);
+    }
+  };
+
+  const handleDesktopAction = async (action: DesktopActionRead) => {
+    if (action.status !== "proposed" && action.status !== "approved") {
+      return;
+    }
+    if (executingDesktopActions.has(action.action_id)) return;
+    executingDesktopActions.add(action.action_id);
+
+    const confirmRequired = action.requires_confirmation;
+    if (confirmRequired) {
+      const label = action.display_text || action.reason || action.tool_name;
+      const confirmed = globalThis.confirm
+        ? globalThis.confirm(`Execute this action?\n\n${label}`)
+        : true;
+      if (!confirmed) {
+        updateChatAssistantAction(action.thread_id, action.action_id, (current) => ({
+          ...current,
+          status: "cancelled",
+          error_message: "Cancelled by user.",
+        }));
+        render();
+        scrollChatToBottom();
+        await reportDesktopActionOutcome(action, {
+          status: "cancelled",
+          error_message: "Cancelled by user.",
+        });
+        return;
+      }
+    }
+
+    updateChatAssistantAction(action.thread_id, action.action_id, (current) => ({
+      ...current,
+      status: "approved",
+      error_message: null,
+    }));
+    render();
+    scrollChatToBottom();
+
+    const outcome = await executeDesktopAction(action);
+    updateChatAssistantAction(action.thread_id, action.action_id, (current) => ({
+      ...current,
+      status: outcome.status,
+      result_data: outcome.data ?? null,
+      error_message: outcome.error_message ?? null,
+    }));
+    render();
+    scrollChatToBottom();
+    await reportDesktopActionOutcome(action, outcome);
+  };
+
+  const submitChat = async () => {
+    const inputText = chatDraft.trim();
+    if (!inputText || chatSending) return;
+    const threadId = createDesktopThreadId();
+    const assistantMessageId = threadId;
+
+    const userMessage: ChatMessage = {
+      id: `user-${Date.now()}`,
+      role: "user",
+      text: inputText,
+    };
+    const assistantMessage: ChatMessage = {
+      id: assistantMessageId,
+      role: "assistant",
+      text: ASSISTANT_PLACEHOLDER,
+    };
+    chatMessages = [...chatMessages, userMessage, assistantMessage];
+    chatDraft = "";
+    chatSending = true;
+    if (chatInput) chatInput.value = "";
+    render();
+    scrollChatToBottom();
+
+    try {
+      const response = await apiClient.streamDesktopAgent(
+        {
+          thread_id: threadId,
+          input_text: inputText,
+          client: createDesktopClientContext(),
+        },
+        {
+          onAssistantMessage: (event) => {
+            if (event.thread_id !== threadId) return;
+            updateChatAssistantText(threadId, event.text || "");
+            render();
+            scrollChatToBottom();
+          },
+          onAssistantDelta: (event) => {
+            if (event.thread_id !== threadId) return;
+            updateChatAssistantText(threadId, event.text || "", "append");
+            render();
+            scrollChatToBottom();
+          },
+          onDocument: (event) => {
+            if (event.thread_id && event.thread_id !== threadId) return;
+            upsertChatAssistantDocument(threadId, event);
+            render();
+            scrollChatToBottom();
+          },
+          onActionProposed: (action) => {
+            if (action.thread_id !== threadId) return;
+            upsertChatAssistantAction(threadId, action);
+            upsertChatAssistantMessage(threadId, (message) => ({
+              ...message,
+              text: message.text || action.display_text || action.reason,
+            }));
+            render();
+            scrollChatToBottom();
+            void handleDesktopAction(action);
+          },
+          onAgentError: (event) => {
+            if (event.thread_id !== threadId) return;
+            chatSending = false;
+            updateChatAssistantText(threadId, event.message || ASSISTANT_PLACEHOLDER, "replace", true);
+            render();
+            scrollChatToBottom();
+          },
+          onDone: (event) => {
+            if (event.thread_id !== threadId) return;
+            chatSending = false;
+            render();
+            scrollChatToBottom();
+          },
+        },
+      );
+      if (response !== null) {
+        const actions = collectDesktopActions(response);
+        const documents = collectDesktopDocuments(response);
+        upsertChatAssistantMessage(threadId, (message) => ({
+          ...message,
+          text: responseText(response),
+          actions: actions.length > 0 ? mergeDesktopActions(message.actions, actions) : message.actions,
+          documents: documents.length > 0 ? mergeDesktopDocuments(message.documents, documents) : message.documents,
+          error: false,
+        }));
+        for (const action of actions) {
+          void handleDesktopAction(action);
+        }
+      }
+    } catch (error) {
+      upsertChatAssistantMessage(threadId, (message) => ({
+        ...message,
+        text: error instanceof Error ? error.message : String(error),
+        error: true,
+      }));
+    } finally {
+      chatSending = false;
+      render();
+      scrollChatToBottom();
+    }
   };
 
   const currentAssets = () => filteredAssets(history, activeAssetFilter, searchQuery);
@@ -2122,14 +2998,39 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   };
 
   const renderChatPage = () => {
-    if (chatFeed instanceof HTMLElement && chatToolbar instanceof HTMLElement) {
-      renderStaticChat(chatFeed, chatToolbar);
+    if (
+      chatFeed instanceof HTMLElement &&
+      chatToolbar instanceof HTMLElement &&
+      chatResources instanceof HTMLElement
+    ) {
+      renderStaticChat(
+        chatFeed,
+        chatToolbar,
+        chatResources,
+        chatMessages,
+        chatSending,
+        chatDrawerState,
+        () => {
+          chatDrawerState =
+            chatDrawerState.kind === "tools" ? { kind: "closed" } : { kind: "tools" };
+          render();
+        },
+        (document, citationIndex) => {
+          chatDrawerState = { kind: "document", document, citationIndex };
+          render();
+        },
+        () => {
+          chatDrawerState = { kind: "closed" };
+          render();
+        },
+      );
     }
-    if (chatResources instanceof HTMLElement) {
-      chatResources.innerHTML = "";
+    if (chatInput instanceof HTMLTextAreaElement && chatInput.value !== chatDraft) {
+      chatInput.value = chatDraft;
     }
     if (chatSubmit instanceof HTMLButtonElement) {
-      chatSubmit.disabled = false;
+      chatSubmit.disabled = chatSending || !chatDraft.trim();
+      chatSubmit.classList.toggle("is-loading", chatSending);
     }
   };
 
@@ -2173,6 +3074,28 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   searchInput?.addEventListener("input", () => {
     searchQuery = searchInput.value.trim();
     render();
+  });
+  chatInput?.addEventListener("input", () => {
+    chatDraft = chatInput.value;
+    if (chatSubmit instanceof HTMLButtonElement) {
+      chatSubmit.disabled = chatSending || !chatDraft.trim();
+    }
+  });
+  chatInput?.addEventListener("keydown", (event) => {
+    if (
+      event.key === "Enter" &&
+      !event.shiftKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !(event as KeyboardEvent).isComposing
+    ) {
+      event.preventDefault();
+      void submitChat();
+    }
+  });
+  chatSubmit?.addEventListener("click", () => {
+    void submitChat();
   });
   notebookNew?.addEventListener("click", () => {
     // 新建便签：先进入编辑态；只有真的输入内容后才会落库并出现在列表
@@ -2299,3 +3222,7 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
     render();
   });
 }
+
+
+
+

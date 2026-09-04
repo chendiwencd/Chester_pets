@@ -148,3 +148,98 @@ export interface FileReaderResponse {
   used_ocr: boolean;
   documents: FileReaderDocument[];
 }
+
+export type DesktopActionRisk = "low" | "medium" | "high";
+
+export interface DesktopToolCapability {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  risk_level: DesktopActionRisk;
+  requires_confirmation: boolean;
+}
+
+export interface DesktopCapabilitiesPayload {
+  capabilities: DesktopToolCapability[];
+}
+
+export interface DesktopClientContext {
+  platform?: string;
+  capabilities: DesktopToolCapability[];
+}
+
+export interface AgentInvokeRequest {
+  thread_id: string;
+  input_text: string;
+  top_k?: number;
+  file_id?: string | null;
+  client?: DesktopClientContext | null;
+}
+
+export type DesktopAgentInvokeRequest = AgentInvokeRequest;
+
+export interface DesktopActionRead {
+  action_id: string;
+  thread_id: string;
+  tool_name: string;
+  arguments: Record<string, unknown>;
+  reason: string;
+  display_text: string;
+  risk_level: DesktopActionRisk;
+  requires_confirmation: boolean;
+  status: "proposed" | "approved" | "success" | "error" | "cancelled";
+  result_data?: Record<string, unknown> | null;
+  error_message?: string | null;
+}
+
+export interface DesktopDocumentRead {
+  file_id: string;
+  file_name: string;
+  chunk_id: string;
+  chunk_index: number;
+  content: string;
+  metadata: Record<string, unknown>;
+  score: number;
+}
+
+export interface DesktopAgentAssistantMessageEvent {
+  thread_id: string;
+  text: string;
+}
+
+export interface DesktopAgentDeltaEvent {
+  thread_id: string;
+  text: string;
+  agent?: string;
+}
+
+export interface DesktopAgentDocumentEvent extends DesktopDocumentRead {
+  thread_id?: string;
+}
+
+export interface DesktopAgentErrorEvent {
+  thread_id: string;
+  agent?: string;
+  message: string;
+}
+
+export interface DesktopAgentDoneEvent {
+  thread_id: string;
+}
+
+export interface DesktopAgentStreamHandlers {
+  onAssistantMessage?: (event: DesktopAgentAssistantMessageEvent) => void;
+  onAssistantDelta?: (event: DesktopAgentDeltaEvent) => void;
+  onDocument?: (event: DesktopAgentDocumentEvent) => void;
+  onActionProposed?: (action: DesktopActionRead) => void;
+  onAgentError?: (event: DesktopAgentErrorEvent) => void;
+  onDone?: (event: DesktopAgentDoneEvent) => void;
+}
+
+export interface DesktopActionResultRequest {
+  status: "success" | "error" | "cancelled";
+  data?: Record<string, unknown>;
+  error_message?: string | null;
+}
+
+export type DesktopAgentInvokeResponse = unknown;

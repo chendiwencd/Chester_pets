@@ -2281,6 +2281,7 @@ body {
 }
 
 .workspace-chat-layout {
+  position: relative;
   width: 100%;
   height: 100%;
   min-height: 0;
@@ -2310,7 +2311,7 @@ body {
 
 .workspace-chat-bubble {
   max-width: 82%;
-  padding: 14px 16px;
+  padding: 2px 16px;
   border-radius: 20px;
   font-size: 14px;
   line-height: 1.7;
@@ -2326,6 +2327,225 @@ body {
   border: 1px solid rgba(126, 94, 70, 0.12);
   background: rgba(251, 246, 239, 0.96);
   color: #3f281b;
+}
+
+.workspace-chat-bubble.is-error {
+  border-color: rgba(185, 86, 71, 0.24);
+  background: rgba(255, 240, 236, 0.96);
+  color: #8f3e33;
+}
+
+.workspace-chat-message-text {
+  white-space: pre-wrap;
+}
+
+.workspace-chat-action-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.workspace-chat-action-card {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid rgba(126, 94, 70, 0.12);
+  border-left: 3px solid rgba(139, 170, 132, 0.72);
+  border-radius: 10px;
+  background: rgba(255, 250, 244, 0.72);
+}
+
+.workspace-chat-action-card[data-risk="medium"] {
+  border-left-color: rgba(184, 132, 89, 0.82);
+}
+
+.workspace-chat-action-card[data-risk="high"] {
+  border-left-color: rgba(185, 86, 71, 0.82);
+}
+
+.workspace-chat-action-card[data-status="error"] {
+  border-left-color: rgba(185, 86, 71, 0.88);
+  background: rgba(255, 243, 239, 0.96);
+}
+
+.workspace-chat-action-card[data-status="cancelled"] {
+  border-left-color: rgba(146, 146, 146, 0.8);
+}
+
+.workspace-chat-action-title {
+  color: #3f281b;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.workspace-chat-action-body,
+.workspace-chat-action-meta {
+  color: #725846;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.workspace-chat-action-meta {
+  color: #9a7d68;
+}
+
+.workspace-chat-action-error {
+  color: #a13f31;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.workspace-chat-action-args {
+  max-height: 120px;
+  margin: 0;
+  overflow: auto;
+  color: #5f4738;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.workspace-chat-citation {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 22px;
+  margin: 0 2px;
+  padding: 0 7px;
+  border: 1px solid rgba(104, 146, 171, 0.2);
+  border-radius: 999px;
+  background: rgba(104, 146, 171, 0.08);
+  color: #2c566d;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  vertical-align: baseline;
+  cursor: pointer;
+}
+
+.workspace-chat-citation:hover,
+.workspace-chat-citation.is-active {
+  border-color: rgba(104, 146, 171, 0.34);
+  background: rgba(104, 146, 171, 0.16);
+}
+
+.workspace-chat-composer-card {
+  /* layout handles overlay positioning */
+}
+
+.workspace-chat-resources {
+  display: block;
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none;
+}
+
+.workspace-chat-resources.is-open {
+  pointer-events: auto;
+}
+
+.workspace-chat-drawer {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.workspace-chat-drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  padding: 0;
+  background: rgba(35, 22, 14, 0.12);
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 0.18s ease;
+}
+
+.workspace-chat-resources.is-open .workspace-chat-drawer-backdrop {
+  opacity: 1;
+}
+
+.workspace-chat-drawer-sheet {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: min(420px, 44%);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-left: 1px solid rgba(126, 94, 70, 0.16);
+  background: rgba(255, 251, 245, 0.98);
+  box-shadow: -16px 0 34px rgba(63, 40, 27, 0.14);
+  transform: translateX(102%);
+  transition: transform 0.2s ease;
+  backdrop-filter: blur(12px);
+}
+
+.workspace-chat-resources.is-open .workspace-chat-drawer-sheet {
+  transform: translateX(0);
+}
+
+.workspace-chat-drawer-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 14px 12px;
+  border-bottom: 1px solid rgba(126, 94, 70, 0.12);
+  background: linear-gradient(135deg, rgba(166, 124, 88, 0.08), rgba(104, 146, 171, 0.05));
+}
+
+.workspace-chat-drawer-header-copy {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.workspace-chat-drawer-title {
+  color: #3f281b;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-chat-drawer-meta {
+  color: #7e5e46;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.workspace-chat-drawer-body {
+  min-height: 0;
+  flex: 1;
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  overflow: auto;
+}
+
+.workspace-chat-drawer-content {
+  margin: 0;
+  overflow: auto;
+  color: #374e5c;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@media (max-width: 900px) {
+  .workspace-chat-drawer-sheet {
+    width: 100%;
+  }
 }
 
 .workspace-chat-toolbar {
@@ -2345,7 +2565,14 @@ body {
   border-radius: 999px;
   background: rgba(251, 246, 239, 0.96);
   color: #836957;
-  cursor: default;
+  cursor: pointer;
+}
+
+.workspace-tool-button:hover,
+.workspace-tool-button.is-active {
+  border-color: rgba(166, 124, 88, 0.3);
+  background: #a67c58;
+  color: #fff8ef;
 }
 
 .workspace-tool-button::before {
@@ -2407,8 +2634,114 @@ body {
   gap: 12px;
 }
 
-.workspace-chat-resources {
-  display: none;
+.workspace-tool-panel {
+  display: grid;
+  gap: 0;
+  padding: 0;
+  border: 0;
+}
+
+.workspace-tool-capability-list {
+  display: grid;
+  overflow: auto;
+  border-top: 0;
+  align-content: start;
+}
+
+.workspace-tool-capability {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 12px;
+  padding: 11px 4px 11px 10px;
+  border-bottom: 1px solid rgba(126, 94, 70, 0.1);
+  border-left: 3px solid rgba(139, 170, 132, 0.72);
+}
+
+.workspace-tool-capability[data-risk="medium"] {
+  border-left-color: rgba(184, 132, 89, 0.82);
+}
+
+.workspace-tool-capability[data-risk="high"] {
+  border-left-color: rgba(185, 86, 71, 0.82);
+}
+
+.workspace-tool-capability-main {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.workspace-tool-capability-name {
+  color: #3f281b;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.workspace-tool-capability-desc {
+  color: #7c6250;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.workspace-tool-capability-meta,
+.workspace-tool-params {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.workspace-tool-params {
+  grid-column: 1 / -1;
+  justify-content: flex-start;
+}
+
+.workspace-tool-risk,
+.workspace-tool-confirm,
+.workspace-tool-param {
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.workspace-tool-risk {
+  background: rgba(139, 170, 132, 0.18);
+  color: #587451;
+}
+
+.workspace-tool-risk.is-medium {
+  background: rgba(184, 132, 89, 0.18);
+  color: #8a5e39;
+}
+
+.workspace-tool-risk.is-high {
+  background: rgba(185, 86, 71, 0.18);
+  color: #9b4538;
+}
+
+.workspace-tool-confirm {
+  background: rgba(185, 86, 71, 0.1);
+  color: #9b4538;
+}
+
+.workspace-tool-param {
+  border: 1px solid rgba(126, 94, 70, 0.1);
+  background: rgba(251, 246, 239, 0.82);
+  color: #725846;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.workspace-tool-param.is-empty {
+  color: #9f8673;
 }
 
 .workspace-chat-composer {
@@ -2457,6 +2790,32 @@ body {
   color: #fff8ef;
   cursor: default;
   box-shadow: 0 8px 18px rgba(121, 86, 58, 0.2);
+}
+
+.workspace-send-button:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.workspace-send-button.is-loading {
+  color: transparent;
+}
+
+.workspace-send-button.is-loading::after {
+  content: "";
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255, 248, 239, 0.42);
+  border-top-color: #fff8ef;
+  border-radius: 999px;
+  animation: workspace-spin 800ms linear infinite;
+}
+
+@keyframes workspace-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .workspace-send-icon {
@@ -2539,6 +2898,14 @@ body {
 
   .workspace-chat-bubble {
     max-width: 90%;
+  }
+
+  .workspace-tool-capability {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workspace-tool-capability-meta {
+    justify-content: flex-start;
   }
 }
 

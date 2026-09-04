@@ -143,8 +143,6 @@ function buildChatPage(): HTMLElement {
   const layout = element("div", "workspace-chat-layout");
   const thread = element("section", "workspace-card workspace-chat-thread-card");
   const header = element("div", "workspace-card-header");
-  const status = element("span", "workspace-status-pill", "持续中");
-  status.id = "workspace-chat-status";
   header.append(element("span", "workspace-kicker", "当前对话"), status);
   const feed = element("div", "workspace-chat-feed");
   feed.id = "workspace-chat-feed";
@@ -170,8 +168,8 @@ function buildChatPage(): HTMLElement {
   inputShell.append(input, submit);
   footer.append(hint);
   composer.append(inputShell, footer);
-  composerCard.append(resources, composer);
-  layout.append(thread, toolbar, composerCard);
+  composerCard.append(composer);
+  layout.append(thread, toolbar, composerCard, resources);
   page.appendChild(layout);
   return page;
 }
