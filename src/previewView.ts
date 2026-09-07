@@ -3,6 +3,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { apiClient } from "./api/authClient";
 import type {
   DesktopActionRead,
+  AgentMessageRead,
+  AgentThreadRead,
   DesktopAgentDocumentEvent,
   DesktopAgentInvokeResponse,
   DesktopDocumentRead,
@@ -121,6 +123,7 @@ interface ChatTaskRecord {
 type ChatDrawerState =
   | { kind: "closed" }
   | { kind: "tools" }
+  | { kind: "history" }
   | { kind: "tasks" }
   | { kind: "document"; document: DesktopDocumentRead; citationIndex: number };
 
@@ -209,6 +212,13 @@ function formatTime(ms: number): string {
 
   // 非当月：显示年月日
   return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+}
+
+function formatDateTimeLabel(value: string | number | Date): string {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const p2 = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${p2(date.getMonth() + 1)}-${p2(date.getDate())} ${p2(date.getHours())}:${p2(date.getMinutes())}`;
 }
 
 function kindLabel(kind: PanelKind): string {
@@ -443,6 +453,51 @@ function capabilityLabelForTool(toolName: string): string {
 
 function actionBodyText(action: DesktopActionRead): string {
   return action.reason || action.display_text || "等待执行";
+}
+
+function firstUserMessageFromSummary(summary: string | null | undefined): string {
+  const text = (summary || "").trim();
+  if (!text) return "";
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    const match = line.match(/^user:\s*(.*)$/i);
+    if (match) return match[1].trim();
+  }
+  return lines[0]?.trim() || "";
+}
+
+function threadSummary(thread: AgentThreadRead): string {
+  const summary = firstUserMessageFromSummary(thread.last_turn_summary);
+  if (summary) return ellipsize(summary, 60);
+  return `对话 ${thread.thread_id.slice(0, 12)}`;
+}
+
+function threadTitle(thread: AgentThreadRead): string {
+  const metadataTitle =
+    typeof thread.metadata.title === "string" && thread.metadata.title.trim()
+      ? thread.metadata.title.trim()
+      : null;
+  return metadataTitle || threadSummary(thread);
+}
+
+function normalizeHistoryRole(role: string): "user" | "assistant" {
+  return role === "user" ? "user" : "assistant";
+}
+
+function mapHistoryMessagesToChatMessages(messages: AgentMessageRead[]): ChatMessage[] {
+  return [...messages]
+    .sort((left, right) => {
+      if (left.turn_number !== right.turn_number) return left.turn_number - right.turn_number;
+      if (left.message_index !== right.message_index) return left.message_index - right.message_index;
+      return left.created_at.localeCompare(right.created_at);
+    })
+    .filter((message) => message.content.trim())
+    .map((message) => ({
+      id: message.id,
+      role: normalizeHistoryRole(message.role),
+      text: message.content,
+      error: message.stream_status === "error",
+    }));
 }
 
 function safeStore(key: string, value: string): void {
@@ -2169,6 +2224,10 @@ function renderChatDrawer(
   root: HTMLElement,
   drawerState: ChatDrawerState,
   tasks: ChatTaskRecord[],
+  historyThreads: AgentThreadRead[],
+  historyThreadsLoading: boolean,
+  historyError: string | null,
+  onRestoreHistoryThread: (thread: AgentThreadRead) => void,
   onClose: () => void,
 ): void {
   root.innerHTML = "";
@@ -2195,6 +2254,8 @@ function renderChatDrawer(
   kicker.textContent =
     drawerState.kind === "tools"
       ? "工具"
+      : drawerState.kind === "history"
+        ? "历史"
       : drawerState.kind === "tasks"
         ? "任务"
         : `引用 ${drawerState.citationIndex}`;
@@ -2203,6 +2264,8 @@ function renderChatDrawer(
   title.textContent =
     drawerState.kind === "tools"
       ? "工具能力"
+      : drawerState.kind === "history"
+        ? "历史对话"
       : drawerState.kind === "tasks"
         ? "任务记录"
         : drawerState.document.file_name;
@@ -2222,6 +2285,33 @@ function renderChatDrawer(
 
   if (drawerState.kind === "tools") {
     renderToolCapabilityList(body);
+  } else if (drawerState.kind === "history") {
+    if (historyThreadsLoading) {
+      body.appendChild(createEmptyState("正在加载历史对话", "稍等一下，正在同步最近线程。"));
+    } else if (historyError) {
+      body.appendChild(createEmptyState("历史对话加载失败", historyError));
+    } else if (historyThreads.length === 0) {
+      body.appendChild(createEmptyState("暂无历史对话", "完成过的 Agent 对话会显示在这里。"));
+    } else {
+      const list = document.createElement("div");
+      list.className = "workspace-chat-history-list";
+      for (const thread of historyThreads) {
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = "workspace-chat-history-item";
+        item.addEventListener("click", () => onRestoreHistoryThread(thread));
+
+        const itemTitle = document.createElement("div");
+        itemTitle.className = "workspace-chat-history-item-title";
+        itemTitle.textContent = threadSummary(thread);
+        const itemMeta = document.createElement("div");
+        itemMeta.className = "workspace-chat-history-item-meta";
+        itemMeta.textContent = formatDateTimeLabel(thread.last_activity_at);
+        item.append(itemTitle, itemMeta);
+        list.appendChild(item);
+      }
+      body.appendChild(list);
+    }
   } else if (drawerState.kind === "tasks") {
     if (tasks.length === 0) {
       body.appendChild(createEmptyState("暂无任务", "新的 Agent 动作会记录在这里，并在下次打开时保留。"));
@@ -2276,8 +2366,13 @@ function renderStaticChat(
   sending: boolean,
   drawerState: ChatDrawerState,
   tasks: ChatTaskRecord[],
+  historyThreads: AgentThreadRead[],
+  historyThreadsLoading: boolean,
+  historyError: string | null,
   onToggleTools: () => void,
+  onToggleHistory: () => void,
   onToggleTasks: () => void,
+  onRestoreHistoryThread: (thread: AgentThreadRead) => void,
   onOpenDocument: (document: DesktopDocumentRead, citationIndex: number) => void,
   onCloseDrawer: () => void,
 ): void {
@@ -2323,17 +2418,23 @@ function renderStaticChat(
   ];
   for (const tool of tools) {
     const isToolsButton = tool.name === "plug-zap";
+    const isHistoryButton = tool.name === "history";
     const isTasksButton = tool.name === "list-todo";
     const button = document.createElement("button");
     button.type = "button";
     button.className = "workspace-tool-button";
     if (isToolsButton && drawerState.kind === "tools") button.classList.add("is-active");
+    if (isHistoryButton && drawerState.kind === "history") button.classList.add("is-active");
     if (isTasksButton && drawerState.kind === "tasks") button.classList.add("is-active");
     button.setAttribute("aria-label", tool.label);
     if (isToolsButton) {
       button.setAttribute("aria-controls", "workspace-chat-resources");
       button.setAttribute("aria-expanded", String(drawerState.kind === "tools"));
       button.addEventListener("click", onToggleTools);
+    } else if (isHistoryButton) {
+      button.setAttribute("aria-controls", "workspace-chat-resources");
+      button.setAttribute("aria-expanded", String(drawerState.kind === "history"));
+      button.addEventListener("click", onToggleHistory);
     } else if (isTasksButton) {
       button.setAttribute("aria-controls", "workspace-chat-resources");
       button.setAttribute("aria-expanded", String(drawerState.kind === "tasks"));
@@ -2344,7 +2445,16 @@ function renderStaticChat(
     toolbarRoot.appendChild(button);
   }
 
-  renderChatDrawer(resourcesRoot, drawerState, tasks, onCloseDrawer);
+  renderChatDrawer(
+    resourcesRoot,
+    drawerState,
+    tasks,
+    historyThreads,
+    historyThreadsLoading,
+    historyError,
+    onRestoreHistoryThread,
+    onCloseDrawer,
+  );
 }
 
 
@@ -2374,6 +2484,8 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   const chatResources = document.getElementById("workspace-chat-resources");
   const chatInput = document.getElementById("workspace-chat-input") as HTMLTextAreaElement | null;
   const chatSubmit = document.getElementById("workspace-chat-submit");
+  const chatThreadStatus = document.getElementById("workspace-chat-thread-status");
+  const chatNewThreadButton = document.getElementById("workspace-chat-new-thread");
 
   let history: ClipboardHistoryItem[] = [];
   let activePage: WorkspacePage = "assets";
@@ -2387,6 +2499,12 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   let chatSending = false;
   let chatMessages: ChatMessage[] = [];
   let chatTasks: ChatTaskRecord[] = readChatTasks();
+  let currentChatThreadId = createDesktopThreadId();
+  let currentChatThreadLabel = "新对话";
+  let historyThreads: AgentThreadRead[] = [];
+  let historyThreadsLoading = false;
+  let historyError: string | null = null;
+  const latestAssistantMessageIds = new Map<string, string>();
   const executingDesktopActions = new Set<string>();
   let transientAsset: PanelContentPayload | undefined;
   let transientNote: PanelContentPayload | undefined;
@@ -2660,14 +2778,15 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
     threadId: string,
     updater: (message: ChatMessage) => ChatMessage,
   ) => {
+    const messageId = latestAssistantMessageIds.get(threadId) ?? threadId;
     const index = chatMessages.findIndex(
-      (message) => message.id === threadId && message.role === "assistant",
+      (message) => message.id === messageId && message.role === "assistant",
     );
     const baseMessage: ChatMessage =
       index >= 0
         ? chatMessages[index]
         : {
-            id: threadId,
+            id: messageId,
             role: "assistant",
             text: "",
           };
@@ -2755,6 +2874,73 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
     });
   };
 
+  const refreshChatThreadLabel = () => {
+    const currentThread = historyThreads.find((thread) => thread.thread_id === currentChatThreadId);
+    if (currentThread) {
+      currentChatThreadLabel = threadTitle(currentThread);
+      return;
+    }
+    currentChatThreadLabel = chatMessages.length > 0 ? "当前会话" : "新对话";
+  };
+
+  const startNewConversation = () => {
+    if (chatSending) return;
+    currentChatThreadId = createDesktopThreadId();
+    currentChatThreadLabel = "新对话";
+    chatMessages = [];
+    latestAssistantMessageIds.clear();
+    chatDraft = "";
+    chatDrawerState = { kind: "closed" };
+    if (chatInput) chatInput.value = "";
+    render();
+  };
+
+  const loadAgentHistoryThreads = async () => {
+    const authState = authStore.getState();
+    if (!authState.onlineMode || !authState.isLoggedIn) {
+      historyThreads = [];
+      historyError = "请先登录并开启在线模式。";
+      render();
+      return;
+    }
+    historyThreadsLoading = true;
+    historyError = null;
+    render();
+    try {
+      const response = await apiClient.listAgentThreads(1, 20);
+      historyThreads = response.items ?? [];
+    } catch (error) {
+      historyThreads = [];
+      historyError = error instanceof Error ? error.message : String(error);
+    } finally {
+      historyThreadsLoading = false;
+      render();
+    }
+  };
+
+  const openHistoryDrawer = () => {
+    chatDrawerState = { kind: "history" };
+    void loadAgentHistoryThreads();
+    render();
+  };
+
+  const restoreHistoryThread = async (thread: AgentThreadRead) => {
+    try {
+      const response = await apiClient.listAgentThreadMessages(thread.thread_id, 1, 100);
+      currentChatThreadId = thread.thread_id;
+      currentChatThreadLabel = threadTitle(thread);
+      chatMessages = mapHistoryMessagesToChatMessages(response.items ?? []);
+      latestAssistantMessageIds.delete(thread.thread_id);
+      chatDrawerState = { kind: "closed" };
+      setPage("chat");
+      render();
+      scrollChatToBottom();
+    } catch (error) {
+      historyError = error instanceof Error ? error.message : String(error);
+      render();
+    }
+  };
+
   const reportDesktopActionOutcome = async (
     action: DesktopActionRead,
     outcome: { status: "success" | "error" | "cancelled"; data?: Record<string, unknown>; error_message?: string },
@@ -2828,8 +3014,9 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   const submitChat = async () => {
     const inputText = chatDraft.trim();
     if (!inputText || chatSending) return;
-    const threadId = createDesktopThreadId();
-    const assistantMessageId = threadId;
+    const threadId = currentChatThreadId;
+    const assistantMessageId = `assistant-${threadId}-${Date.now()}`;
+    latestAssistantMessageIds.set(threadId, assistantMessageId);
 
     const userMessage: ChatMessage = {
       id: `user-${Date.now()}`,
@@ -2842,6 +3029,7 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
       text: ASSISTANT_PLACEHOLDER,
     };
     chatMessages = [...chatMessages, userMessage, assistantMessage];
+    refreshChatThreadLabel();
     chatDraft = "";
     chatSending = true;
     if (chatInput) chatInput.value = "";
@@ -3201,6 +3389,13 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   };
 
   const renderChatPage = () => {
+    refreshChatThreadLabel();
+    if (chatThreadStatus instanceof HTMLElement) {
+      chatThreadStatus.textContent = currentChatThreadLabel;
+    }
+    if (chatNewThreadButton instanceof HTMLButtonElement) {
+      chatNewThreadButton.disabled = chatSending;
+    }
     if (
       chatFeed instanceof HTMLElement &&
       chatToolbar instanceof HTMLElement &&
@@ -3214,15 +3409,24 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
         chatSending,
         chatDrawerState,
         chatTasks,
+        historyThreads,
+        historyThreadsLoading,
+        historyError,
         () => {
           chatDrawerState =
             chatDrawerState.kind === "tools" ? { kind: "closed" } : { kind: "tools" };
           render();
         },
         () => {
+          openHistoryDrawer();
+        },
+        () => {
           chatDrawerState =
             chatDrawerState.kind === "tasks" ? { kind: "closed" } : { kind: "tasks" };
           render();
+        },
+        (thread) => {
+          void restoreHistoryThread(thread);
         },
         (document, citationIndex) => {
           chatDrawerState = { kind: "document", document, citationIndex };
@@ -3318,6 +3522,9 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   });
   chatSubmit?.addEventListener("click", () => {
     void submitChat();
+  });
+  chatNewThreadButton?.addEventListener("click", () => {
+    startNewConversation();
   });
   notebookNew?.addEventListener("click", () => {
     // 新建便签：先进入编辑态；只有真的输入内容后才会落库并出现在列表

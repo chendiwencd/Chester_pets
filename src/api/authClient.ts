@@ -28,6 +28,8 @@
   FileReaderResponse,
   TextUploadRequest,
   TextUploadResponse,
+  AgentThreadPage,
+  AgentThreadMessagesPage,
 } from "./types";
 
 export type { FileReaderResponse } from "./types";
@@ -361,6 +363,28 @@ export class ApiClient {
 
   async invokeDesktopAgent(data: DesktopAgentInvokeRequest): Promise<DesktopAgentInvokeResponse> {
     return this.invokeAgent(data);
+  }
+
+  async listAgentThreads(page = 1, pageSize = 20): Promise<AgentThreadPage> {
+    const params = new URLSearchParams({
+      page: String(page),
+      page_size: String(pageSize),
+    });
+    return this.request<AgentThreadPage>(`/api/v1/agent/history?${params.toString()}`);
+  }
+
+  async listAgentThreadMessages(
+    threadId: string,
+    page = 1,
+    pageSize = 50,
+  ): Promise<AgentThreadMessagesPage> {
+    const params = new URLSearchParams({
+      page: String(page),
+      page_size: String(pageSize),
+    });
+    return this.request<AgentThreadMessagesPage>(
+      `/api/v1/agent/history/${encodeURIComponent(threadId)}/messages?${params.toString()}`,
+    );
   }
 
   async reportDesktopActionResult(

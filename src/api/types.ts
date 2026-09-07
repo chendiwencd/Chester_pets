@@ -236,6 +236,46 @@ export interface DesktopAgentStreamHandlers {
   onDone?: (event: DesktopAgentDoneEvent) => void;
 }
 
+export interface AgentThreadRead {
+  thread_id: string;
+  status: string;
+  last_activity_at: string;
+  last_turn_summary: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentThreadPage {
+  items: AgentThreadRead[];
+  page: number;
+  page_size: number;
+  total: number;
+  has_next: boolean;
+}
+
+export interface AgentMessageRead {
+  id: string;
+  thread_id: string;
+  turn_number: number;
+  message_index: number;
+  role: string;
+  agent: string | null;
+  content: string;
+  stream_status: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentThreadMessagesPage {
+  items: AgentMessageRead[];
+  page: number;
+  page_size: number;
+  total: number;
+  has_next: boolean;
+}
+
 export interface DesktopActionResultRequest {
   status: "success" | "error" | "cancelled";
   data?: Record<string, unknown>;

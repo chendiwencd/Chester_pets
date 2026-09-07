@@ -143,7 +143,14 @@ function buildChatPage(): HTMLElement {
   const layout = element("div", "workspace-chat-layout");
   const thread = element("section", "workspace-card workspace-chat-thread-card");
   const header = element("div", "workspace-card-header");
-  header.append(element("span", "workspace-kicker", "当前对话"), status);
+  const copy = element("div");
+  const kicker = element("span", "workspace-kicker", "当前对话");
+  const status = element("div", "workspace-page-count", "新对话");
+  status.id = "workspace-chat-thread-status";
+  copy.append(kicker, status);
+  const actions = element("div", "workspace-inline-actions");
+  actions.appendChild(button("workspace-chat-new-thread", "workspace-icon-button", "新建对话", "plus"));
+  header.append(copy, actions);
   const feed = element("div", "workspace-chat-feed");
   feed.id = "workspace-chat-feed";
   thread.append(header, feed);

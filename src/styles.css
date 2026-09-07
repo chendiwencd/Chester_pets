@@ -2590,6 +2590,38 @@ body {
   word-break: break-word;
 }
 
+.workspace-chat-history-list {
+  display: grid;
+  gap: 8px;
+  overflow: auto;
+  align-content: start;
+}
+
+.workspace-chat-history-item {
+  width: 100%;
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid rgba(126, 94, 70, 0.12);
+  border-radius: 14px;
+  background: rgba(251, 246, 239, 0.92);
+  text-align: left;
+  cursor: pointer;
+}
+
+.workspace-chat-history-item-title {
+  color: #432b1d;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.workspace-chat-history-item-meta {
+  color: #9a7d68;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 @media (max-width: 900px) {
   .workspace-chat-drawer-sheet {
     width: 100%;
