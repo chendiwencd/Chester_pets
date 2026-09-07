@@ -39,6 +39,8 @@ export interface FileReaderOptions {
   indexEmbeddings?: boolean;
 }
 
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL?.trim() || "http://127.0.0.1:5000";
+
 function formatApiError(payload: unknown, fallback: string): string {
   if (!payload || typeof payload !== "object") return fallback;
   const detail = (payload as ApiError).detail;
@@ -179,7 +181,7 @@ export class ApiClient {
   private baseURL: string;
   private refreshPromise: Promise<boolean> | null = null;
 
-  constructor(baseURL: string = "http://127.0.0.1:5000") {
+  constructor(baseURL: string = API_BASE_URL) {
     this.baseURL = baseURL;
   }
 
@@ -607,4 +609,3 @@ export class ApiClient {
 }
 
 export const apiClient = new ApiClient();
-
