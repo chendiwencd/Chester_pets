@@ -159,7 +159,25 @@ impl Database {
             row.get::<_, i64>(0)
         })? > MAX_HISTORY
         {
-            let deleted = transaction.execute(
+            let deleted_non_asset = transaction.execute(
+                "
+                DELETE FROM history_items
+                WHERE id = (
+                    SELECT id
+                    FROM history_items
+                    WHERE pinned = 0
+                      AND kind IN ('text', 'web', 'note')
+                    ORDER BY created_at_ms ASC, id ASC
+                    LIMIT 1
+                )
+                ",
+                [],
+            )?;
+            if deleted_non_asset > 0 {
+                continue;
+            }
+
+            let deleted_any = transaction.execute(
                 "
                 DELETE FROM history_items
                 WHERE id = (
@@ -172,7 +190,7 @@ impl Database {
                 ",
                 [],
             )?;
-            if deleted == 0 {
+            if deleted_any == 0 {
                 break;
             }
         }

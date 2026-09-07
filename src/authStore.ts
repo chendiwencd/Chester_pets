@@ -23,6 +23,7 @@ class AuthStore {
     onlineMode: false,
   };
   private listeners = new Set<AuthListener>();
+  private reloginPromise: Promise<boolean> | null = null;
 
   constructor() {
     this.loadFromStorage();
@@ -193,6 +194,32 @@ class AuthStore {
 
     const response = await apiClient.refreshToken({ refresh_token: refreshToken });
     this.saveAuthResponse(response);
+  }
+
+  async reloginWithSavedCredentials(): Promise<boolean> {
+    if (!this.reloginPromise) {
+      this.reloginPromise = (async () => {
+        const saved = this.getSavedLoginCredentials();
+        if (!saved) {
+          return false;
+        }
+        try {
+          const response = await apiClient.accountLogin({
+            identifier: saved.identifier,
+            password: saved.password,
+          });
+          this.saveAuthResponse(response);
+          window.dispatchEvent(new CustomEvent("auth-refreshed"));
+          return true;
+        } catch (error) {
+          console.error("[authStore] reloginWithSavedCredentials failed", error);
+          return false;
+        }
+      })().finally(() => {
+        this.reloginPromise = null;
+      });
+    }
+    return this.reloginPromise;
   }
 }
 

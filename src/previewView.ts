@@ -1,4 +1,4 @@
-﻿import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { apiClient } from "./api/authClient";
 import type {
@@ -15,6 +15,7 @@ import {
   createDesktopClientContext,
   executeDesktopAction,
 } from "./clientActions";
+import { importFileSilentWithReader, type MaterialImportResult } from "./materialImport";
 import { resolveImageSrc } from "./media";
 import { createWorkspaceIcon, type WorkspaceIconName } from "./workspaceIcons";
 import { initWorkspaceSettingsPage } from "./workspaceSettingsPage";
@@ -65,6 +66,7 @@ interface SavedResource {
   path?: string | null;
   summary?: string | null;
   extracted_text?: string | null;
+  remote_file_id?: string | null;
   size_bytes?: number | null;
   mime_type?: string | null;
   history_item_id?: number;
@@ -347,6 +349,10 @@ function filteredNotes(history: ClipboardHistoryItem[], query: string): Clipboar
   return notebookItems(history).filter((item) => matchesQuery(item, query));
 }
 
+function isAuthExpiredError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("登录已失效");
+}
+
 function assetSelectionFromItem(item: ClipboardHistoryItem): AssetSelection {
   const resource = item.resources?.find((candidate) => candidate.kind === item.kind) ?? item.resources?.[0];
   const parsedDescription =
@@ -449,6 +455,31 @@ function capabilityLabelForTool(toolName: string): string {
     DESKTOP_TOOL_CAPABILITIES.find((capability) => capability.name === toolName)?.label_name ||
     toolName
   );
+}
+
+function findImportedAsset(
+  history: ClipboardHistoryItem[],
+  imported: MaterialImportResult,
+  fallbackName: string,
+): ClipboardHistoryItem | undefined {
+  const preview = imported.material?.preview?.trim() || "";
+  const remoteFileId = (imported.reader?.file_id || imported.material?.file_id || "").trim();
+  const name = (imported.material?.name || fallbackName).trim().toLowerCase();
+  return assetItems(history).find((item) => {
+    if (preview && item.value.trim() === preview) {
+      return true;
+    }
+    return (item.resources ?? []).some((resource) => {
+      const resourcePath = resource.path?.trim() || "";
+      const resourceName = (resource.name || "").trim().toLowerCase();
+      const resourceRemoteFileId = (resource.remote_file_id || "").trim();
+      return (
+        (preview && resourcePath === preview) ||
+        (remoteFileId && resourceRemoteFileId === remoteFileId) ||
+        (name && resourceName === name)
+      );
+    });
+  });
 }
 
 function actionBodyText(action: DesktopActionRead): string {
@@ -2365,10 +2396,12 @@ function renderStaticChat(
   messages: ChatMessage[],
   sending: boolean,
   drawerState: ChatDrawerState,
+  materialImporting: boolean,
   tasks: ChatTaskRecord[],
   historyThreads: AgentThreadRead[],
   historyThreadsLoading: boolean,
   historyError: string | null,
+  onPickMaterials: () => void,
   onToggleTools: () => void,
   onToggleHistory: () => void,
   onToggleTasks: () => void,
@@ -2417,6 +2450,7 @@ function renderStaticChat(
     { name: "list-todo", label: "查看任务" },
   ];
   for (const tool of tools) {
+    const isMaterialsButton = tool.name === "paperclip";
     const isToolsButton = tool.name === "plug-zap";
     const isHistoryButton = tool.name === "history";
     const isTasksButton = tool.name === "list-todo";
@@ -2426,8 +2460,11 @@ function renderStaticChat(
     if (isToolsButton && drawerState.kind === "tools") button.classList.add("is-active");
     if (isHistoryButton && drawerState.kind === "history") button.classList.add("is-active");
     if (isTasksButton && drawerState.kind === "tasks") button.classList.add("is-active");
+    if (isMaterialsButton && materialImporting) button.disabled = true;
     button.setAttribute("aria-label", tool.label);
-    if (isToolsButton) {
+    if (isMaterialsButton) {
+      button.addEventListener("click", onPickMaterials);
+    } else if (isToolsButton) {
       button.setAttribute("aria-controls", "workspace-chat-resources");
       button.setAttribute("aria-expanded", String(drawerState.kind === "tools"));
       button.addEventListener("click", onToggleTools);
@@ -2499,6 +2536,11 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   let chatSending = false;
   let chatMessages: ChatMessage[] = [];
   let chatTasks: ChatTaskRecord[] = readChatTasks();
+  let chatMaterialImporting = false;
+  const chatMaterialInput = document.createElement("input");
+  chatMaterialInput.type = "file";
+  chatMaterialInput.multiple = true;
+  chatMaterialInput.hidden = true;
   let currentChatThreadId = createDesktopThreadId();
   let currentChatThreadLabel = "新对话";
   let historyThreads: AgentThreadRead[] = [];
@@ -2773,6 +2815,125 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
     if (!target) return;
     void syncHistoryItem(target);
   };
+
+  const replaceChatMessage = (id: string, updater: (message: ChatMessage) => ChatMessage) => {
+    const index = chatMessages.findIndex((message) => message.id === id);
+    if (index < 0) return;
+    const next = updater(chatMessages[index]);
+    chatMessages = [...chatMessages.slice(0, index), next, ...chatMessages.slice(index + 1)];
+  };
+
+  const startChatMaterialImport = async (files: File[]) => {
+    if (files.length === 0 || chatMaterialImporting) return;
+    const authState = authStore.getState();
+    if (!authState.onlineMode || !authState.isLoggedIn) {
+      chatMessages = [
+        ...chatMessages,
+        {
+          id: `chat-material-error-${Date.now()}`,
+          role: "assistant",
+          text: "请先登录并开启在线模式，再使用文件总结。",
+          error: true,
+        },
+      ];
+      render();
+      scrollChatToBottom();
+      return;
+    }
+
+    chatMaterialImporting = true;
+    render();
+    try {
+      for (const file of files) {
+        const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const userMessageId = `chat-material-user-${stamp}`;
+        const assistantMessageId = `chat-material-assistant-${stamp}`;
+        const displayName = file.name || "未命名文件";
+        chatMessages = [
+          ...chatMessages,
+          {
+            id: userMessageId,
+            role: "user",
+            text: `总结这个文件：${displayName}`,
+          },
+          {
+            id: assistantMessageId,
+            role: "assistant",
+            text: `正在读取并总结 ${displayName}...`,
+          },
+        ];
+        render();
+        scrollChatToBottom();
+
+        try {
+          let imported;
+          try {
+            imported = await importFileSilentWithReader(file);
+          } catch (error) {
+            if (!isAuthExpiredError(error)) {
+              throw error;
+            }
+            const relogged = await authStore.reloginWithSavedCredentials();
+            if (!relogged) {
+              setPage("settings");
+              render();
+              throw new Error("登录已失效，且无法自动重新登录，请到设置页重新登录。");
+            }
+            imported = await importFileSilentWithReader(file);
+          }
+          const summary = imported.reader?.summary?.trim() || imported.material?.overview?.trim() || "";
+          const historySnapshot = await invoke<ClipboardHistoryItem[]>("get_clipboard_history").catch(() => null);
+          if (historySnapshot) {
+            history = historySnapshot;
+          }
+          const importedItem = findImportedAsset(history, imported, displayName);
+          if (importedItem?.id !== undefined) {
+            selectedAssetId = importedItem.id;
+            transientAsset = undefined;
+            activeAssetFilter =
+              importedItem.kind === "image"
+                ? "image"
+                : importedItem.kind === "file"
+                  ? "file"
+                  : "all";
+            searchQuery = "";
+            safeStore(LAST_ASSET_KEY, String(importedItem.id));
+          }
+          if (!imported.material && !imported.reader) {
+            throw new Error("生成总结失败，请稍后重试。");
+          }
+          replaceChatMessage(assistantMessageId, (message) => ({
+            ...message,
+            text:
+              summary ||
+              (imported.reader
+                ? `${displayName} 已完成解析，并已尝试同步到素材区。`
+                : `${displayName} 已导入素材区，但接口未返回摘要。`),
+            error: false,
+          }));
+        } catch (error) {
+          replaceChatMessage(assistantMessageId, (message) => ({
+            ...message,
+            text: error instanceof Error ? error.message : "导入失败，请稍后重试。",
+            error: true,
+          }));
+        } finally {
+          render();
+          scrollChatToBottom();
+        }
+      }
+    } finally {
+      chatMaterialImporting = false;
+      render();
+    }
+  };
+
+  chatMaterialInput.addEventListener("change", () => {
+    const files = Array.from(chatMaterialInput.files ?? []);
+    chatMaterialInput.value = "";
+    void startChatMaterialImport(files);
+  });
+  document.body.appendChild(chatMaterialInput);
 
   const upsertChatAssistantMessage = (
     threadId: string,
@@ -3408,10 +3569,16 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
         chatMessages,
         chatSending,
         chatDrawerState,
+        chatMaterialImporting,
         chatTasks,
         historyThreads,
         historyThreadsLoading,
         historyError,
+        () => {
+          if (chatMaterialImporting) return;
+          chatMaterialInput.value = "";
+          chatMaterialInput.click();
+        },
         () => {
           chatDrawerState =
             chatDrawerState.kind === "tools" ? { kind: "closed" } : { kind: "tools" };

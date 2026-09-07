@@ -36,6 +36,7 @@ export type { FileReaderResponse } from "./types";
 
 export interface FileReaderOptions {
   aiSummary?: boolean;
+  indexEmbeddings?: boolean;
 }
 
 function formatApiError(payload: unknown, fallback: string): string {
@@ -574,6 +575,7 @@ export class ApiClient {
   ): Promise<FileReaderResponse> {
     const form = new FormData();
     form.append("ai_summary", String(options.aiSummary ?? false));
+    form.append("index_embeddings", String(options.indexEmbeddings ?? false));
     const upload = mimeType && file.type !== mimeType
       ? new Blob([file], { type: mimeType })
       : file;
