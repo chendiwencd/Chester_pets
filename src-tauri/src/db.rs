@@ -4,7 +4,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::state::{ClipboardHistoryItem, SavedResourceInput};
 
-const MAX_HISTORY: i64 = 100;
+const MAX_HISTORY: i64 = 500;
 
 pub struct Database {
     connection: Connection,
@@ -166,7 +166,7 @@ impl Database {
                     SELECT id
                     FROM history_items
                     WHERE pinned = 0
-                      AND kind IN ('text', 'web', 'note')
+                      AND kind IN ('text', 'web')
                     ORDER BY created_at_ms ASC, id ASC
                     LIMIT 1
                 )

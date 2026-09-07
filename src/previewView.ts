@@ -3282,6 +3282,36 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   const currentNotes = () => filteredNotes(history, searchQuery);
   const selectedAssetItem = () => history.find((item) => item.id === selectedAssetId && item.kind !== "note");
   const selectedNoteItem = () => history.find((item) => item.id === selectedNoteId && item.kind === "note");
+  const flushPendingNotebookEditor = () => {
+    const draft = notebookEditor;
+    if (!draft?.isEditing) return;
+    const title = draft.title;
+    const text = draft.text;
+    if (!title.trim() && !text.trim()) return;
+
+    if (draft.id) {
+      void invoke("update_clipboard_history_item", {
+        id: draft.id,
+        value: text,
+        preview: title || text.split(/\r?\n/)[0] || "无标题",
+      }).catch(() => {});
+      return;
+    }
+
+    if (draft.creating) return;
+    notebookEditor = { ...draft, creating: true };
+    void invoke<number | null>("create_note_history_item", { title, value: text })
+      .then((id) => {
+        if (!id && notebookEditor?.id === null) {
+          notebookEditor = { ...notebookEditor, creating: false };
+        }
+      })
+      .catch(() => {
+        if (notebookEditor?.id === null) {
+          notebookEditor = { ...notebookEditor, creating: false };
+        }
+      });
+  };
 
   const setPage = (page: WorkspacePage) => {
     activePage = page;
@@ -3300,6 +3330,7 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   };
 
   const selectAsset = (item: ClipboardHistoryItem) => {
+    flushPendingNotebookEditor();
     selectedAssetId = item.id;
     transientAsset = undefined;
     safeStore(LAST_ASSET_KEY, String(item.id));
@@ -3308,6 +3339,7 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   };
 
   const selectNote = (item: ClipboardHistoryItem) => {
+    flushPendingNotebookEditor();
     selectedNoteId = item.id;
     transientNote = undefined;
     safeStore(LAST_NOTE_KEY, String(item.id));
@@ -3646,21 +3678,26 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   });
 
   closeButton?.addEventListener("click", () => {
+    flushPendingNotebookEditor();
     invoke("close_preview").catch(() => {});
   });
   navAssets?.addEventListener("click", () => {
+    flushPendingNotebookEditor();
     setPage("assets");
     render();
   });
   navNotebook?.addEventListener("click", () => {
+    flushPendingNotebookEditor();
     setPage("notebook");
     render();
   });
   navChat?.addEventListener("click", () => {
+    flushPendingNotebookEditor();
     setPage("chat");
     render();
   });
   navSettings?.addEventListener("click", () => {
+    flushPendingNotebookEditor();
     setPage("settings");
     render();
   });
@@ -3830,7 +3867,6 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
     render();
   });
 }
-
 
 
 

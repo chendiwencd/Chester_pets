@@ -1,7 +1,7 @@
 [package]
-name = "desktop-shell"
+name = "ChesterBot"
 version = "0.1.0"
-description = "A Tauri App"
+description = "桌面宠物app"
 authors = ["you"]
 edition = "2021"
 
