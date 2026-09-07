@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::json;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::image::Image;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -582,6 +583,134 @@ fn guess_mime_type(path: &Path) -> Option<String> {
     Some(mime.to_string())
 }
 
+fn collect_workspace_files(root: &Path, output: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_workspace_files(&path, output);
+        } else if path.is_file() {
+            output.push(path);
+        }
+    }
+}
+
+fn workspace_file_key(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+fn reconcile_workspace_materials(app: &AppHandle, state: &State<AppState>) -> Vec<ClipboardHistoryItem> {
+    let Ok(history) = crate::db::database_mut(app, |database| database.load_history()) else {
+        return state.clipboard_history.lock().unwrap().clone();
+    };
+
+    let Some(workspace_dir) = crate::state::current_workspace_dir(app) else {
+        *state.clipboard_history.lock().unwrap() = history.clone();
+        return history;
+    };
+
+    let mut known_paths = HashSet::new();
+    for item in &history {
+        if (item.kind == "image" || item.kind == "file") && !item.value.trim().is_empty() {
+            known_paths.insert(workspace_file_key(Path::new(item.value.trim())));
+        }
+        for resource in &item.resources {
+            if let Some(path) = resource.path.as_deref() {
+                let trimmed = path.trim();
+                if !trimmed.is_empty() {
+                    known_paths.insert(workspace_file_key(Path::new(trimmed)));
+                }
+            }
+        }
+    }
+
+    let mut workspace_files = Vec::new();
+    collect_workspace_files(&workspace_dir, &mut workspace_files);
+
+    let mut inserted_any = false;
+    let _ = crate::db::database_mut(app, |database| {
+        for path in workspace_files {
+            let key = workspace_file_key(&path);
+            if known_paths.contains(&key) {
+                continue;
+            }
+
+            let kind = classify_path_kind(&path);
+            if kind != "image" && kind != "file" {
+                continue;
+            }
+
+            let metadata = match std::fs::metadata(&path) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let created_at_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or_else(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| duration.as_millis() as u64)
+                        .unwrap_or(0)
+                });
+            let path_string = path.to_string_lossy().to_string();
+            let file_name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("未命名文件")
+                .to_string();
+            let resource = SavedResourceInput {
+                kind: kind.to_string(),
+                name: file_name.clone(),
+                path: Some(path_string.clone()),
+                summary: None,
+                extracted_text: None,
+                remote_file_id: None,
+                size_bytes: Some(metadata.len()),
+                mime_type: guess_mime_type(&path),
+                extension: path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.to_ascii_lowercase()),
+                width: None,
+                height: None,
+            };
+
+            if database
+                .insert_history(
+                    kind,
+                    &path_string,
+                    &file_name,
+                    created_at_ms,
+                    Some("not_uploaded"),
+                    None,
+                    &[resource],
+                )
+                .is_ok()
+            {
+                known_paths.insert(key);
+                inserted_any = true;
+            }
+        }
+        Ok(())
+    });
+
+    let next_history = if inserted_any {
+        crate::db::database_mut(app, |database| database.load_history()).unwrap_or(history)
+    } else {
+        history
+    };
+    *state.clipboard_history.lock().unwrap() = next_history.clone();
+    next_history
+}
+
 #[tauri::command]
 pub fn paste_clipboard_to_input_panel(
     app: AppHandle,
@@ -888,11 +1017,7 @@ pub fn open_original_image(app: AppHandle, value: String) {
 
 #[tauri::command]
 pub fn get_clipboard_history(app: AppHandle, state: State<AppState>) -> Vec<ClipboardHistoryItem> {
-    if let Ok(history) = crate::db::database_mut(&app, |database| database.load_history()) {
-        *state.clipboard_history.lock().unwrap() = history.clone();
-        return history;
-    }
-    state.clipboard_history.lock().unwrap().clone()
+    reconcile_workspace_materials(&app, &state)
 }
 
 #[tauri::command]

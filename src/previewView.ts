@@ -25,6 +25,7 @@ const NOTE_RESOURCE_MARKER = "[[desktop-shell:resources:v1]]";
 const LAST_ASSET_KEY = "desktop-shell.workspace.last-asset-id";
 const LAST_NOTE_KEY = "desktop-shell.workspace.last-note-id";
 const NOTE_ORDER_KEY = "desktop-shell.workspace.note-order";
+const CHAT_TASKS_KEY = "desktop-shell.workspace.chat-tasks";
 const ASSISTANT_PLACEHOLDER = "正在打开 Agent...";
 
 interface PanelContentPayload {
@@ -103,9 +104,24 @@ interface ChatMessage {
   error?: boolean;
 }
 
+interface ChatTaskRecord {
+  action_id: string;
+  thread_id: string;
+  tool_name: string;
+  label_name: string;
+  body: string;
+  arguments: Record<string, unknown>;
+  risk_level: DesktopActionRead["risk_level"];
+  requires_confirmation: boolean;
+  status: DesktopActionRead["status"];
+  error_message?: string | null;
+  updated_at_ms: number;
+}
+
 type ChatDrawerState =
   | { kind: "closed" }
   | { kind: "tools" }
+  | { kind: "tasks" }
   | { kind: "document"; document: DesktopDocumentRead; citationIndex: number };
 
 function normalizedUploadState(item: ClipboardHistoryItem): UploadState {
@@ -418,6 +434,17 @@ function workspacePlaceholder(page: WorkspacePage): string {
   return "搜索消息、文件或任务";
 }
 
+function capabilityLabelForTool(toolName: string): string {
+  return (
+    DESKTOP_TOOL_CAPABILITIES.find((capability) => capability.name === toolName)?.label_name ||
+    toolName
+  );
+}
+
+function actionBodyText(action: DesktopActionRead): string {
+  return action.reason || action.display_text || "等待执行";
+}
+
 function safeStore(key: string, value: string): void {
   try {
     localStorage.setItem(key, value);
@@ -432,6 +459,54 @@ function safeRead(key: string): string | null {
   } catch {
     return null;
   }
+}
+
+function readChatTasks(): ChatTaskRecord[] {
+  const raw = safeRead(CHAT_TASKS_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item): item is ChatTaskRecord => {
+        if (!item || typeof item !== "object") return false;
+        const record = item as Partial<ChatTaskRecord>;
+        return (
+          typeof record.action_id === "string" &&
+          typeof record.thread_id === "string" &&
+          typeof record.tool_name === "string" &&
+          typeof record.label_name === "string" &&
+          typeof record.body === "string" &&
+          typeof record.arguments === "object" &&
+          record.arguments !== null &&
+          typeof record.risk_level === "string" &&
+          typeof record.status === "string"
+        );
+      })
+      .sort((left, right) => (right.updated_at_ms ?? 0) - (left.updated_at_ms ?? 0));
+  } catch {
+    return [];
+  }
+}
+
+function writeChatTasks(tasks: ChatTaskRecord[]): void {
+  safeStore(CHAT_TASKS_KEY, JSON.stringify(tasks));
+}
+
+function taskRecordFromAction(action: DesktopActionRead): ChatTaskRecord {
+  return {
+    action_id: action.action_id,
+    thread_id: action.thread_id,
+    tool_name: action.tool_name,
+    label_name: capabilityLabelForTool(action.tool_name),
+    body: actionBodyText(action),
+    arguments: action.arguments,
+    risk_level: action.risk_level,
+    requires_confirmation: action.requires_confirmation,
+    status: action.status,
+    error_message: action.error_message ?? null,
+    updated_at_ms: Date.now(),
+  };
 }
 
 function readNotebookOrder(): number[] {
@@ -2032,24 +2107,11 @@ function renderChatMessage(
 
       const title = document.createElement("div");
       title.className = "workspace-chat-action-title";
-      title.textContent = action.tool_name;
+      title.textContent = capabilityLabelForTool(action.tool_name);
       const body = document.createElement("div");
       body.className = "workspace-chat-action-body";
-      body.textContent = action.reason || action.display_text;
-      const meta = document.createElement("div");
-      meta.className = "workspace-chat-action-meta";
-      meta.textContent = `${action.status} / ${action.risk_level}${action.requires_confirmation ? " / confirm" : ""}`;
-      const args = document.createElement("pre");
-      args.className = "workspace-chat-action-args";
-      args.textContent = JSON.stringify(action.arguments, null, 2);
-
-      item.append(title, body, meta, args);
-      if (action.error_message) {
-        const error = document.createElement("div");
-        error.className = "workspace-chat-action-error";
-        error.textContent = action.error_message;
-        item.appendChild(error);
-      }
+      body.textContent = actionBodyText(action);
+      item.append(title, body);
       actions.appendChild(item);
     }
     bubble.appendChild(actions);
@@ -2106,6 +2168,7 @@ function renderToolCapabilityList(root: HTMLElement): void {
 function renderChatDrawer(
   root: HTMLElement,
   drawerState: ChatDrawerState,
+  tasks: ChatTaskRecord[],
   onClose: () => void,
 ): void {
   root.innerHTML = "";
@@ -2129,11 +2192,20 @@ function renderChatDrawer(
   titleWrap.className = "workspace-chat-drawer-header-copy";
   const kicker = document.createElement("div");
   kicker.className = "workspace-kicker";
-  kicker.textContent = drawerState.kind === "tools" ? "工具" : `引用 ${drawerState.citationIndex}`;
+  kicker.textContent =
+    drawerState.kind === "tools"
+      ? "工具"
+      : drawerState.kind === "tasks"
+        ? "任务"
+        : `引用 ${drawerState.citationIndex}`;
   const title = document.createElement("div");
   title.className = "workspace-chat-drawer-title";
   title.textContent =
-    drawerState.kind === "tools" ? "工具能力" : drawerState.document.file_name;
+    drawerState.kind === "tools"
+      ? "工具能力"
+      : drawerState.kind === "tasks"
+        ? "任务记录"
+        : drawerState.document.file_name;
   titleWrap.append(kicker, title);
 
   const closeBtn = document.createElement("button");
@@ -2150,6 +2222,36 @@ function renderChatDrawer(
 
   if (drawerState.kind === "tools") {
     renderToolCapabilityList(body);
+  } else if (drawerState.kind === "tasks") {
+    if (tasks.length === 0) {
+      body.appendChild(createEmptyState("暂无任务", "新的 Agent 动作会记录在这里，并在下次打开时保留。"));
+    } else {
+      const list = document.createElement("div");
+      list.className = "workspace-chat-task-list";
+      for (const task of tasks) {
+        const item = document.createElement("article");
+        item.className = "workspace-tool-capability workspace-chat-task-card";
+        item.dataset.risk = task.risk_level;
+        item.dataset.status = task.status;
+
+        const main = document.createElement("div");
+        main.className = "workspace-tool-capability-main";
+        const taskTitle = document.createElement("div");
+        taskTitle.className = "workspace-tool-capability-name workspace-chat-task-title";
+        taskTitle.textContent = task.label_name;
+        const time = document.createElement("div");
+        time.className = "workspace-chat-task-time";
+        time.textContent = formatTime(task.updated_at_ms);
+        const content = document.createElement("div");
+        content.className = "workspace-tool-capability-desc workspace-chat-task-body";
+        content.textContent = task.body;
+        main.append(taskTitle, time, content);
+        item.appendChild(main);
+
+        list.appendChild(item);
+      }
+      body.appendChild(list);
+    }
   } else {
     const meta = document.createElement("div");
     meta.className = "workspace-chat-drawer-meta";
@@ -2173,7 +2275,9 @@ function renderStaticChat(
   messages: ChatMessage[],
   sending: boolean,
   drawerState: ChatDrawerState,
+  tasks: ChatTaskRecord[],
   onToggleTools: () => void,
+  onToggleTasks: () => void,
   onOpenDocument: (document: DesktopDocumentRead, citationIndex: number) => void,
   onCloseDrawer: () => void,
 ): void {
@@ -2219,22 +2323,28 @@ function renderStaticChat(
   ];
   for (const tool of tools) {
     const isToolsButton = tool.name === "plug-zap";
+    const isTasksButton = tool.name === "list-todo";
     const button = document.createElement("button");
     button.type = "button";
     button.className = "workspace-tool-button";
     if (isToolsButton && drawerState.kind === "tools") button.classList.add("is-active");
+    if (isTasksButton && drawerState.kind === "tasks") button.classList.add("is-active");
     button.setAttribute("aria-label", tool.label);
     if (isToolsButton) {
       button.setAttribute("aria-controls", "workspace-chat-resources");
       button.setAttribute("aria-expanded", String(drawerState.kind === "tools"));
       button.addEventListener("click", onToggleTools);
+    } else if (isTasksButton) {
+      button.setAttribute("aria-controls", "workspace-chat-resources");
+      button.setAttribute("aria-expanded", String(drawerState.kind === "tasks"));
+      button.addEventListener("click", onToggleTasks);
     }
     button.title = tool.label;
     button.appendChild(createWorkspaceIcon(tool.name, "workspace-inline-icon workspace-icon-tool"));
     toolbarRoot.appendChild(button);
   }
 
-  renderChatDrawer(resourcesRoot, drawerState, onCloseDrawer);
+  renderChatDrawer(resourcesRoot, drawerState, tasks, onCloseDrawer);
 }
 
 
@@ -2276,6 +2386,7 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   let chatDraft = "";
   let chatSending = false;
   let chatMessages: ChatMessage[] = [];
+  let chatTasks: ChatTaskRecord[] = readChatTasks();
   const executingDesktopActions = new Set<string>();
   let transientAsset: PanelContentPayload | undefined;
   let transientNote: PanelContentPayload | undefined;
@@ -2285,6 +2396,7 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   let assetTranslation: AssetTranslationState | undefined;
   const inflightSync = new Set<number>();
   const pendingTextUploadKey = "pending_text_upload_ids";
+  let textQueueFlushing = false;
 
   const loadPendingTextIds = (): number[] => {
     try {
@@ -2302,6 +2414,60 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
 
   const savePendingTextIds = (ids: number[]) => {
     localStorage.setItem(pendingTextUploadKey, JSON.stringify(ids));
+  };
+
+  const isBatchTextItem = (item: ClipboardHistoryItem): boolean =>
+    item.kind === "text" || item.kind === "web" || item.kind === "note";
+
+  const orderedBatchTextItems = (): ClipboardHistoryItem[] =>
+    history
+      .filter((item) => isBatchTextItem(item) && item.id)
+      .slice()
+      .sort((left, right) => {
+        if (left.created_at_ms !== right.created_at_ms) return left.created_at_ms - right.created_at_ms;
+        return left.id - right.id;
+      });
+
+  const reconcilePendingTextIds = (includeBacklog = true): number[] => {
+    const queued = loadPendingTextIds();
+    const available = new Map<number, ClipboardHistoryItem>();
+    for (const item of orderedBatchTextItems()) {
+      available.set(item.id, item);
+    }
+
+    const next: number[] = [];
+    const seen = new Set<number>();
+    const appendIfValid = (id: number) => {
+      if (!Number.isFinite(id) || id <= 0 || seen.has(id)) return;
+      const item = available.get(id);
+      if (!item) return;
+      const state = normalizedUploadState(item);
+      if (state === "uploaded" || state === "failed") return;
+      seen.add(id);
+      next.push(id);
+    };
+
+    for (const id of queued) appendIfValid(id);
+    if (includeBacklog) {
+      for (const item of available.values()) {
+        const state = normalizedUploadState(item);
+        if (state === "not_uploaded" || state === "uploading") {
+          appendIfValid(item.id);
+        }
+      }
+    }
+
+    savePendingTextIds(next);
+    return next;
+  };
+
+  const enqueuePendingTextItem = (item: ClipboardHistoryItem): void => {
+    if (!item.id || !isBatchTextItem(item)) return;
+    const ids = reconcilePendingTextIds(false);
+    if (!ids.includes(item.id)) {
+      ids.push(item.id);
+      savePendingTextIds(ids);
+    }
   };
 
   const formatTextBatchFileName = () => {
@@ -2327,65 +2493,89 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
   };
 
   const flushTextUploadQueue = async () => {
+    if (textQueueFlushing) return;
     const authState = authStore.getState();
     if (!authState.onlineMode || !authState.isLoggedIn) return;
-
-    let batchSize = 50;
+    textQueueFlushing = true;
     try {
-      batchSize = await invoke<number>("get_text_upload_batch_size");
+      let batchSize = 50;
+      try {
+        batchSize = await invoke<number>("get_text_upload_batch_size");
+      } catch {}
+
+      while (true) {
+        const ids = reconcilePendingTextIds(true);
+        if (ids.length < batchSize) return;
+
+        const currentIds = ids.slice(0, batchSize);
+        const restIds = ids.slice(batchSize);
+        const items = currentIds
+          .map((id) => history.find((candidate) => candidate.id === id))
+          .filter((value): value is ClipboardHistoryItem => value !== undefined && isBatchTextItem(value));
+
+        if (items.length < batchSize) {
+          savePendingTextIds(restIds);
+          continue;
+        }
+
+        for (const item of items) {
+          if (normalizedUploadState(item) !== "uploading") {
+            await invoke("update_history_upload_state", {
+              id: item.id,
+              uploadState: "uploading",
+              remoteFileId: null,
+              overview: null,
+              extractedText: null,
+            }).catch(() => {});
+          }
+        }
+
+        try {
+          const response = await apiClient.textUpload({
+            text: buildBatchText(items),
+            file_name: formatTextBatchFileName(),
+          });
+          const fileId = (response as { file_id?: string }).file_id ?? null;
+          for (const item of items) {
+            await invoke("update_history_upload_state", {
+              id: item.id,
+              uploadState: "uploaded",
+              remoteFileId: fileId,
+              overview: null,
+              extractedText: null,
+            });
+          }
+          savePendingTextIds(restIds);
+        } catch (error) {
+          console.error("[text_upload] failed", error);
+          for (const item of items) {
+            await invoke("update_history_upload_state", {
+              id: item.id,
+              uploadState: "failed",
+              remoteFileId: null,
+              overview: null,
+              extractedText: null,
+            }).catch(() => {});
+          }
+          savePendingTextIds(restIds);
+          return;
+        }
+      }
+    } finally {
+      textQueueFlushing = false;
+    }
+  };
+
+  const triggerAutoSyncCatchUp = async () => {
+    const authState = authStore.getState();
+    if (!authState.onlineMode || !authState.isLoggedIn) return;
+    let enabled = false;
+    try {
+      enabled = await invoke<boolean>("get_auto_sync");
     } catch {}
-
-    let ids = loadPendingTextIds();
-    if (ids.length < batchSize) return;
-
-    // 只处理前 batchSize 条，避免一次上传过大；剩余的下一轮再处理
-    const current = ids.slice(0, batchSize);
-    const rest = ids.slice(batchSize);
-
-    const items = current
-      .map((id) => history.find((candidate) => candidate.id === id))
-      .filter((value): value is ClipboardHistoryItem => Boolean(value));
-
-    if (items.length === 0) {
-      savePendingTextIds(rest);
-      return;
-    }
-
-    try {
-      const response = await apiClient.textUpload({
-        text: buildBatchText(items),
-        file_name: formatTextBatchFileName(),
-      });
-      const fileId = (response as { file_id?: string }).file_id ?? null;
-      for (const item of items) {
-        await invoke("update_history_upload_state", {
-          id: item.id,
-          uploadState: "uploaded",
-          remoteFileId: fileId,
-          overview: null,
-          extractedText: null,
-        });
-      }
-      savePendingTextIds(rest);
-    } catch (error) {
-      console.error("[text_upload] failed", error);
-      // 失败：把这一批标记为 failed，并从队列里移除，允许用户重试
-      for (const item of items) {
-        await invoke("update_history_upload_state", {
-          id: item.id,
-          uploadState: "failed",
-          remoteFileId: null,
-          overview: null,
-          extractedText: null,
-        }).catch(() => {});
-      }
-      savePendingTextIds(rest);
-    }
-
-    // 如果剩余仍满足阈值，继续 flush
-    if (loadPendingTextIds().length >= batchSize) {
-      await flushTextUploadQueue();
-    }
+    if (!enabled) return;
+    reconcilePendingTextIds(true);
+    await flushTextUploadQueue();
   };
 
   const blobFromDataUrl = (dataUrl: string): { blob: Blob; mimeType: string; fileName: string } | null => {
@@ -2408,18 +2598,7 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
     try {
       // 文本类型素材：不逐条上传。先加入待上传队列，达到阈值后合并上传。
       if (item.kind !== "image" && item.kind !== "file") {
-        await invoke("update_history_upload_state", {
-          id: item.id,
-          uploadState: "uploading",
-          remoteFileId: null,
-          overview: null,
-          extractedText: null,
-        });
-        const ids = loadPendingTextIds();
-        if (!ids.includes(item.id)) {
-          ids.push(item.id);
-          savePendingTextIds(ids);
-        }
+        enqueuePendingTextItem(item);
         await flushTextUploadQueue();
         return;
       }
@@ -2507,6 +2686,17 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
     }));
   };
 
+  const upsertChatTask = (action: DesktopActionRead) => {
+    const next = taskRecordFromAction(action);
+    const index = chatTasks.findIndex((task) => task.action_id === next.action_id);
+    if (index >= 0) {
+      chatTasks = [next, ...chatTasks.filter((task) => task.action_id !== next.action_id)];
+    } else {
+      chatTasks = [next, ...chatTasks];
+    }
+    writeChatTasks(chatTasks);
+  };
+
   const upsertChatAssistantDocument = (threadId: string, document: DesktopAgentDocumentEvent) => {
     upsertChatAssistantMessage(threadId, (message) => ({
       ...message,
@@ -2535,16 +2725,26 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
     actionId: string,
     updater: (action: DesktopActionRead) => DesktopActionRead,
   ) => {
+    let updatedAction: DesktopActionRead | undefined;
     upsertChatAssistantMessage(threadId, (message) => {
       if (!message.actions?.length) return message;
       const actions = message.actions.map((action) =>
-        action.action_id === actionId ? updater(action) : action,
+        action.action_id === actionId
+          ? (() => {
+              const nextAction = updater(action);
+              updatedAction = nextAction;
+              return nextAction;
+            })()
+          : action,
       );
       return {
         ...message,
         actions: mergeDesktopActions(actions, []),
       };
     });
+    if (updatedAction) {
+      upsertChatTask(updatedAction);
+    }
   };
 
   const scrollChatToBottom = () => {
@@ -2567,6 +2767,7 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
       });
       if (reported.thread_id === action.thread_id) {
         updateChatAssistantAction(action.thread_id, action.action_id, () => reported);
+        upsertChatTask(reported);
         render();
         scrollChatToBottom();
       }
@@ -2676,6 +2877,7 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
           onActionProposed: (action) => {
             if (action.thread_id !== threadId) return;
             upsertChatAssistantAction(threadId, action);
+            upsertChatTask(action);
             upsertChatAssistantMessage(threadId, (message) => ({
               ...message,
               text: message.text || action.display_text || action.reason,
@@ -2710,6 +2912,7 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
           error: false,
         }));
         for (const action of actions) {
+          upsertChatTask(action);
           void handleDesktopAction(action);
         }
       }
@@ -3010,9 +3213,15 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
         chatMessages,
         chatSending,
         chatDrawerState,
+        chatTasks,
         () => {
           chatDrawerState =
             chatDrawerState.kind === "tools" ? { kind: "closed" } : { kind: "tools" };
+          render();
+        },
+        () => {
+          chatDrawerState =
+            chatDrawerState.kind === "tasks" ? { kind: "closed" } : { kind: "tasks" };
           render();
         },
         (document, citationIndex) => {
@@ -3051,6 +3260,19 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
     initWorkspaceSettingsPage(pageSettings);
   }
   render();
+  void triggerAutoSyncCatchUp();
+
+  const workspaceHeader = document.querySelector<HTMLElement>(".workspace-header");
+  workspaceHeader?.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("button, input, textarea, select, a, .workspace-search, .workspace-header-actions")) {
+      return;
+    }
+    void appWindow.startDragging().catch((error) => {
+      console.error("[previewView] startDragging failed", error);
+    });
+  });
 
   closeButton?.addEventListener("click", () => {
     invoke("close_preview").catch(() => {});
@@ -3157,6 +3379,11 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
     void invoke<boolean>("get_auto_sync")
       .then((enabled) => {
         if (!enabled) return;
+        if (isBatchTextItem(event.payload)) {
+          enqueuePendingTextItem(event.payload);
+          void flushTextUploadQueue();
+          return;
+        }
         void syncHistoryItem(event.payload);
       })
       .catch(() => {});
@@ -3165,7 +3392,11 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
 
   // 重新登录或 token 刷新后，尝试把已积累的文本队列继续 flush（如果达到阈值）
   window.addEventListener("auth-refreshed", () => {
-    void flushTextUploadQueue();
+    void triggerAutoSyncCatchUp();
+  });
+
+  window.addEventListener("auto-sync-changed", () => {
+    void triggerAutoSyncCatchUp();
   });
 
   await appWindow.listen("history-cleared", () => {
@@ -3174,12 +3405,14 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
     selectedNoteId = undefined;
     transientAsset = undefined;
     transientNote = undefined;
+    savePendingTextIds([]);
     writeNotebookOrder([]);
     render();
   });
 
   await appWindow.listen<number>("history-deleted", (event) => {
     history = history.filter((item) => item.id !== event.payload);
+    savePendingTextIds(loadPendingTextIds().filter((id) => id !== event.payload));
     removeNotebookFromOrder(event.payload);
     if (selectedAssetId === event.payload) selectedAssetId = undefined;
     if (selectedNoteId === event.payload) selectedNoteId = undefined;
@@ -3193,6 +3426,7 @@ export async function initPreviewView(_root: HTMLElement): Promise<void> {
 
   await appWindow.listen<ClipboardHistoryItem>("history-updated", (event) => {
     history = history.map((item) => (item.id === event.payload.id ? event.payload : item));
+    reconcilePendingTextIds(true);
     // 自动保存会触发 history-updated；编辑当前便签时避免重绘详情（会导致退出编辑态/丢光标）
     if (
       notebookEditor?.isEditing &&

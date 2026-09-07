@@ -522,7 +522,11 @@ async function renderGeneralSection(root: HTMLElement): Promise<void> {
       "自动同步",
       "新增素材后自动上传到云端并更新上传状态（需在线模式 + 已登录）。",
       autoSync,
-      (next) => invoke<boolean>("set_auto_sync", { enabled: next }),
+      async (next) => {
+        const enabled = await invoke<boolean>("set_auto_sync", { enabled: next });
+        window.dispatchEvent(new CustomEvent("auto-sync-changed", { detail: { enabled } }));
+        return enabled;
+      },
     ),
   );
 
